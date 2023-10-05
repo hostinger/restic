@@ -316,6 +316,7 @@ func TestIsExcludedBySymlinkScope(t *testing.T) {
 	}{
 		{"123", joinFn(tempDir, "foodir/foo"), true},
 		{"1234", "..", false},
+		{"12345", "../..", false},
 
 		{"foodir/insidefoo", joinFn(tempDir, "foodir/foosub/underfoo"), true},
 		{"foodir/outsidefoo2", joinFn(tempDir, "foodir/.."), false},
@@ -338,6 +339,17 @@ func TestIsExcludedBySymlinkScope(t *testing.T) {
 
 	// create rejection function
 	scopeExclude, _ := rejectSymlinksOutsideScope(scopePath)
+
+	// test a case when the file itself is not a symlink
+	// but it still should be excluded
+	symlinkedPath := filepath.Join(tempDir, "12345", "T")
+	fi, err := os.Lstat(symlinkedPath)
+	test.OK(t, err)
+
+	excluded := scopeExclude(symlinkedPath, fi)
+	if !excluded {
+		t.Errorf("inclusion status of %s is wrong: want %v, got %v", symlinkedPath, false, true)
+	}
 
 	// To mock the archiver scanning walk, we create filepath.WalkFn
 	// that tests against the rejection function and stores

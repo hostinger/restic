@@ -397,19 +397,15 @@ func rejectSymlinksOutsideScope(scopePath string) (RejectFunc, error) {
 	}
 
 	return func(item string, fi os.FileInfo) bool {
-		if fi.Mode()&os.ModeSymlink != os.ModeSymlink {
-			return false
-		}
-
 		target, err := filepath.EvalSymlinks(item)
 		if err != nil {
 			// reject symlink if we cannot determine the target
-			debug.Log("could not eval target of symlink: %s", item)
+			debug.Log("could not eval symlinks: %s", item)
 			return true
 		}
 
 		if !strings.HasPrefix(target, scopePath) {
-			debug.Log("target of symlink %s is outside of path: %s", item, scopePath)
+			debug.Log("eval path of %s (%s) is outside of scope: %s", item, target, scopePath)
 			return true
 		}
 
