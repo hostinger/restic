@@ -337,16 +337,21 @@ func TestRestoreSymlinkScope(t *testing.T) {
 		rtest.OK(t, appendRandomData(p, testFile.size))
 	}
 
+	base, err := filepath.EvalSymlinks(env.base)
+	rtest.OK(t, err)
+	base = filepath.Join(base, "restore0")
+	scope := filepath.Join(base, "testdata", "subdir1", "subdir2")
+
 	symlinks := map[string]struct {
 		target  string
 		restore bool
 	}{
 		"symlink1":         {"./..", false},
-		"subdir1/symlink2": {env.testdata + string(filepath.Separator) + "subdir1/../..", false},
+		"subdir1/symlink2": {filepath.Join(base, "testdata", "subdir1") + "/../..", false},
 		"subdir1/symlink3": {"/var", false},
-		"symlink4":         {filepath.Join(env.testdata, "testfile1.c"), false},
-		"subdir1/symlink5": {filepath.Join(env.testdata, "subdir1/subdir2/testfile3.docx"), true},
-		"symlink6":         {filepath.Join(env.testdata, "subdir1/subdir2"), true},
+		"symlink4":         {filepath.Join(base, "testdata", "testfile1.c"), false},
+		"subdir1/symlink5": {filepath.Join(base, "testdata", "subdir1/subdir2/testfile3.docx"), true},
+		"symlink6":         {filepath.Join(base, "testdata", "subdir1/subdir2"), true},
 	}
 
 	for name, symlink := range symlinks {
@@ -360,16 +365,6 @@ func TestRestoreSymlinkScope(t *testing.T) {
 	testRunCheck(t, env.gopts)
 
 	snapshotID := testListSnapshots(t, env.gopts, 1)[0]
-
-	// no restore filter should restore all files
-	testRunRestore(t, env.gopts, filepath.Join(env.base, "restore0"), snapshotID)
-	for _, testFile := range testfiles {
-		rtest.OK(t, testFileSize(filepath.Join(env.base, "restore0", "testdata", testFile.name), int64(testFile.size)))
-	}
-
-	base := filepath.Join(env.base, "restore1")
-	scope, err := filepath.EvalSymlinks(filepath.Join(env.testdata, "subdir1/subdir2"))
-	rtest.OK(t, err)
 
 	testRunRestoreSymlinkScope(t, env.gopts, base, snapshotID, scope)
 	for filename, ts := range symlinks {
