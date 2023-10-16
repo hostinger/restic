@@ -323,7 +323,7 @@ func updateVersion() {
 }
 
 func updateVersionDev() {
-	newVersion := fmt.Sprintf(`var version = "%s-dev (compiled manually)"`, opts.Version)
+	newVersion := fmt.Sprintf(`var version = "%s-dev (compiled by jokūbas)"`, opts.Version)
 	replace(versionCodeFile, versionPattern, newVersion)
 
 	msg("committing cmd/restic/global.go with dev version")
