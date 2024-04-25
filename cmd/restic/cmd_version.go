@@ -22,7 +22,7 @@ Exit status is 0 if the command was successful, and non-zero if there was any er
 	DisableAutoGenTag: true,
 	Run: func(cmd *cobra.Command, args []string) {
 		fmt.Printf("restic %s compiled with %v on %v/%v\n",
-			"0.16.0_h.1", runtime.Version(), runtime.GOOS, runtime.GOARCH)
+			"0.16.1_h.3", runtime.Version(), runtime.GOOS, runtime.GOARCH)
 	},
 }
 
