@@ -84,7 +84,8 @@ func TestRejectSymlinksOutsideScopeExcludesBySymlinkScope(t *testing.T) {
 
 	// test a case when the file itself is not a symlink
 	// but it still should be excluded
-	symlinkedPath := filepath.Join(tempDir, "12345", "T")
+	targetDir := filepath.Base(filepath.Dir(tempDir))
+	symlinkedPath := filepath.Join(tempDir, "12345", targetDir)
 	fi, err := os.Lstat(symlinkedPath)
 	test.OK(t, err)
 
