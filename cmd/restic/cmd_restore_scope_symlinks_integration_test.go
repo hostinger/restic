@@ -5,7 +5,6 @@ import (
 	"path/filepath"
 	"testing"
 
-	"github.com/restic/restic/internal/errors"
 	"github.com/restic/restic/internal/restic"
 	rtest "github.com/restic/restic/internal/test"
 )
@@ -63,10 +62,7 @@ func TestRestoreSymlinkScope(t *testing.T) {
 
 	testRunRestoreSymlinkScope(t, env.gopts, base, snapshotID, scope)
 	for filename, ts := range symlinks {
-		exists, err := testFileExists(filepath.Join(base, "testdata", filename))
-		if err != nil {
-			rtest.OK(t, err)
-		}
+		exists := testFileExists(filepath.Join(base, "testdata", filename))
 		rtest.Assert(t, exists == ts.restore, "expected %v restoration status: %t, but got: %t", filename, ts.restore, exists)
 	}
 }
@@ -80,12 +76,7 @@ func testRunRestoreSymlinkScope(t testing.TB, gopts GlobalOptions, dir string, s
 	rtest.OK(t, testRunRestoreAssumeFailure(snapshotID.String(), opts, gopts))
 }
 
-func testFileExists(filename string) (bool, error) {
-	if _, err := os.Stat(filename); err == nil {
-		return true, nil
-	} else if errors.Is(err, os.ErrNotExist) {
-		return false, nil
-	} else {
-		return false, err
-	}
+func testFileExists(filename string) bool {
+	_, err := os.Stat(filename)
+	return !os.IsNotExist(err)
 }

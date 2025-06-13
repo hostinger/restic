@@ -109,7 +109,7 @@ func NewRestorer(repo restic.Repository, sn *restic.Snapshot, opts Options) *Res
 		SelectFilter:      func(string, bool) (bool, bool) { return true, true },
 		XattrSelectFilter: func(string) bool { return true },
 		sn:                sn,
-		NodeFilter:        func(item string, node *restic.Node) bool { return true },
+		NodeFilter:        func(string, *restic.Node) bool { return true },
 	}
 
 	return r

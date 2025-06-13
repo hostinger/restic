@@ -9,7 +9,7 @@ import (
 	"github.com/restic/restic/internal/fs"
 )
 
-// rejectSymlinksOutsideScope rejects symlinks that target
+// RejectSymlinksOutsideScope rejects symlinks that target
 // files outside of the specified path.
 func RejectSymlinksOutsideScope(scopePath string) (archiver.RejectFunc, error) {
 	var err error
@@ -21,7 +21,7 @@ func RejectSymlinksOutsideScope(scopePath string) (archiver.RejectFunc, error) {
 		}
 	}
 
-	return func(path string, fi *fs.ExtendedFileInfo, fs fs.FS) bool {
+	return func(path string, _ *fs.ExtendedFileInfo, _ fs.FS) bool {
 		target, err := filepath.EvalSymlinks(path)
 		if err != nil {
 			// reject symlink if we cannot determine the target
