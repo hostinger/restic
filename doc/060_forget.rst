@@ -80,7 +80,7 @@ command must be run:
 
     $ restic -r /srv/restic-repo prune
     enter password for repository:
-    repository 33002c5e opened successfully, password is correct
+    repository 33002c5e opened successfully
     loading all snapshots...
     loading indexes...
     finding data that is still in use for 4 snapshots
@@ -88,14 +88,14 @@ command must be run:
     searching used packs...
     collecting packs for deletion and repacking
     [0:00] 100.00%  5 / 5 packs processed
-    
+
     to repack:            69 blobs / 1.078 MiB
     this removes:         67 blobs / 1.047 MiB
     to delete:             7 blobs / 25.726 KiB
     total prune:          74 blobs / 1.072 MiB
     remaining:            16 blobs / 38.003 KiB
     unused size after prune: 0 B (0.00% of remaining size)
-    
+
     repacking packs
     [0:00] 100.00%  2 / 2 packs repacked
     rebuilding index
@@ -134,14 +134,14 @@ to ``forget``:
     searching used packs...
     collecting packs for deletion and repacking
     [0:00] 100.00%  5 / 5 packs processed
-    
+
     to repack:           69 blobs / 1.078 MiB
     this removes         67 blobs / 1.047 MiB
     to delete:            7 blobs / 25.726 KiB
     total prune:         74 blobs / 1.072 MiB
     remaining:           16 blobs / 38.003 KiB
     unused size after prune: 0 B (0.00% of remaining size)
-    
+
     repacking packs
     [0:00] 100.00%  2 / 2 packs repacked
     rebuilding index
@@ -182,7 +182,9 @@ The ``forget`` command accepts the following policy options:
 -  ``--keep-yearly n`` for the last ``n`` years which have one or more
    snapshots, keep only the most recent one for each year.
 -  ``--keep-tag`` keep all snapshots which have all tags specified by
-   this option (can be specified multiple times).
+   this option (can be specified multiple times). The ``forget`` command will
+   exit with an error if all snapshots in a snapshot group would be removed
+   as none of them have the specified tags.
 -  ``--keep-within duration`` keep all snapshots having a timestamp within
    the specified duration of the latest snapshot, where ``duration`` is a
    number of years, months, days, and hours. E.g. ``2y5m7d3h`` will keep all
@@ -205,11 +207,15 @@ The ``forget`` command accepts the following policy options:
     natural time boundaries and *not* relative to when you run ``forget``. Weeks
     are Monday 00:00 to Sunday 23:59, days 00:00 to 23:59, hours :00 to :59, etc.
     They also only count hours/days/weeks/etc which have one or more snapshots.
-    A value of ``-1`` will be interpreted as "forever", i.e. "keep all".
+    A value of ``unlimited`` will be interpreted as "forever", i.e. "keep all".
 
-.. note:: All duration related options (``--keep-{within,-*}``) ignore snapshots
+.. note:: All duration related options (``--keep-{within-,}*``) ignore snapshots
     with a timestamp in the future (relative to when the ``forget`` command is
     run) and these snapshots will hence not be removed.
+
+.. note:: If there are not enough snapshots to keep one for each duration related
+    ``--keep-{within-,}*`` option, the oldest snapshot is kept additionally and
+    marked as ``oldest`` in the output (e.g. ``oldest hourly snapshot``).
 
 .. note:: Specifying ``--keep-tag ''`` will match untagged snapshots only.
 
@@ -260,7 +266,7 @@ Sunday for 12 weeks:
 .. code-block:: console
 
    $ restic snapshots
-   repository f00c6e2a opened successfully, password is correct
+   repository f00c6e2a opened successfully
    ID        Time                 Host        Tags        Paths
    ---------------------------------------------------------------
    0a1f9759  2019-09-01 11:00:00  mopped                  /home/user/work
@@ -284,7 +290,7 @@ four Sundays, and remove the other snapshots:
 .. code-block:: console
 
    $ restic forget --keep-daily 4 --dry-run
-   repository f00c6e2a opened successfully, password is correct
+   repository f00c6e2a opened successfully
    Applying Policy: keep the last 4 daily snapshots
    keep 4 snapshots:
    ID        Time                 Host        Tags        Reasons         Paths
@@ -325,7 +331,7 @@ kept, depending on whether one of them ends up being the same as an already kept
 snapshot. All other snapshots are removed.
 
 You might want to maintain the same policy as in the example above, but have
-irregular backups. For example, the 7 snapshots specified with ``--keep-daily 7`` 
+irregular backups. For example, the 7 snapshots specified with ``--keep-daily 7``
 might be spread over a longer period. If what you want is to keep daily
 snapshots for the last week, weekly for the last month, monthly for the last
 year and yearly for the last 75 years, you can instead specify ``forget
@@ -333,11 +339,22 @@ year and yearly for the last 75 years, you can instead specify ``forget
 --keep-within-yearly 75y`` (note that `1w` is not a recognized duration, so
 you will have to specify `7d` instead).
 
+
+Removing all snapshots
+======================
+
 For safety reasons, restic refuses to act on an "empty" policy. For example,
 if one were to specify ``--keep-last 0`` to forget *all* snapshots in the
 repository, restic will respond that no snapshots will be removed. To delete
 all snapshots, use ``--keep-last 1`` and then finally remove the last snapshot
 manually (by passing the ID to ``forget``).
+
+Since restic 0.17.0, it is possible to delete all snapshots for a specific
+host, tag or path using the ``--unsafe-allow-remove-all`` option. The option
+must always be combined with a snapshot filter (by host, path or tag).
+For example the command ``forget --tag example --unsafe-allow-remove-all``
+removes all snapshots with tag ``example``.
+
 
 Security considerations in append-only mode
 ===========================================
@@ -431,13 +448,13 @@ The ``prune`` command accepts the following options:
       you want to minimize the time and bandwidth used by the ``prune``
       operation. Note that metadata will still be repacked.
 
-   Restic tries to repack as little data as possible while still ensuring this 
+   Restic tries to repack as little data as possible while still ensuring this
    limit for unused data. The default value is 5%.
 
 - ``--max-repack-size size`` if set limits the total size of files to repack.
   As ``prune`` first stores all repacked files and deletes the obsolete files at the end,
   this option might be handy if you expect many files to be repacked and fear to run low
-  on storage. 
+  on storage.
 
 - ``--repack-cacheable-only`` if set to true only files which contain
   metadata and would be stored in the cache are repacked. Other pack files are
@@ -445,6 +462,13 @@ The ``prune`` command accepts the following options:
   using only cached data. It can, however, imply that the unused data in
   your repository exceeds the value given by ``--max-unused``.
   The default value is false.
+
+- ``--repack-small`` if set will repack pack files below 80% of target pack size.
+  The default value is false.
+
+- ``--repack-smaller-than`` will repack all packfiles below the size of
+  ``--repack-smaller-than``. This allows repacking packfiles that initially came from a
+  repository with a smaller ``--pack-size`` to be compacted into larger packfiles.
 
 -  ``--dry-run`` only show what ``prune`` would do.
 

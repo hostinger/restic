@@ -1,291 +1,13 @@
-package restic_test
+package restic
 
 import (
-	"context"
 	"encoding/json"
 	"fmt"
-	"os"
-	"path/filepath"
-	"reflect"
-	"runtime"
 	"testing"
 	"time"
 
-	"github.com/restic/restic/internal/restic"
 	"github.com/restic/restic/internal/test"
-	rtest "github.com/restic/restic/internal/test"
 )
-
-func BenchmarkNodeFillUser(t *testing.B) {
-	tempfile, err := os.CreateTemp("", "restic-test-temp-")
-	if err != nil {
-		t.Fatal(err)
-	}
-
-	fi, err := tempfile.Stat()
-	if err != nil {
-		t.Fatal(err)
-	}
-
-	path := tempfile.Name()
-
-	t.ResetTimer()
-
-	for i := 0; i < t.N; i++ {
-		_, err := restic.NodeFromFileInfo(path, fi)
-		rtest.OK(t, err)
-	}
-
-	rtest.OK(t, tempfile.Close())
-	rtest.RemoveAll(t, tempfile.Name())
-}
-
-func BenchmarkNodeFromFileInfo(t *testing.B) {
-	tempfile, err := os.CreateTemp("", "restic-test-temp-")
-	if err != nil {
-		t.Fatal(err)
-	}
-
-	fi, err := tempfile.Stat()
-	if err != nil {
-		t.Fatal(err)
-	}
-
-	path := tempfile.Name()
-
-	t.ResetTimer()
-
-	for i := 0; i < t.N; i++ {
-		_, err := restic.NodeFromFileInfo(path, fi)
-		if err != nil {
-			t.Fatal(err)
-		}
-	}
-
-	rtest.OK(t, tempfile.Close())
-	rtest.RemoveAll(t, tempfile.Name())
-}
-
-func parseTime(s string) time.Time {
-	t, err := time.Parse("2006-01-02 15:04:05.999", s)
-	if err != nil {
-		panic(err)
-	}
-
-	return t.Local()
-}
-
-var nodeTests = []restic.Node{
-	{
-		Name:       "testFile",
-		Type:       "file",
-		Content:    restic.IDs{},
-		UID:        uint32(os.Getuid()),
-		GID:        uint32(os.Getgid()),
-		Mode:       0604,
-		ModTime:    parseTime("2015-05-14 21:07:23.111"),
-		AccessTime: parseTime("2015-05-14 21:07:24.222"),
-		ChangeTime: parseTime("2015-05-14 21:07:25.333"),
-	},
-	{
-		Name:       "testSuidFile",
-		Type:       "file",
-		Content:    restic.IDs{},
-		UID:        uint32(os.Getuid()),
-		GID:        uint32(os.Getgid()),
-		Mode:       0755 | os.ModeSetuid,
-		ModTime:    parseTime("2015-05-14 21:07:23.111"),
-		AccessTime: parseTime("2015-05-14 21:07:24.222"),
-		ChangeTime: parseTime("2015-05-14 21:07:25.333"),
-	},
-	{
-		Name:       "testSuidFile2",
-		Type:       "file",
-		Content:    restic.IDs{},
-		UID:        uint32(os.Getuid()),
-		GID:        uint32(os.Getgid()),
-		Mode:       0755 | os.ModeSetgid,
-		ModTime:    parseTime("2015-05-14 21:07:23.111"),
-		AccessTime: parseTime("2015-05-14 21:07:24.222"),
-		ChangeTime: parseTime("2015-05-14 21:07:25.333"),
-	},
-	{
-		Name:       "testSticky",
-		Type:       "file",
-		Content:    restic.IDs{},
-		UID:        uint32(os.Getuid()),
-		GID:        uint32(os.Getgid()),
-		Mode:       0755 | os.ModeSticky,
-		ModTime:    parseTime("2015-05-14 21:07:23.111"),
-		AccessTime: parseTime("2015-05-14 21:07:24.222"),
-		ChangeTime: parseTime("2015-05-14 21:07:25.333"),
-	},
-	{
-		Name:       "testDir",
-		Type:       "dir",
-		Subtree:    nil,
-		UID:        uint32(os.Getuid()),
-		GID:        uint32(os.Getgid()),
-		Mode:       0750 | os.ModeDir,
-		ModTime:    parseTime("2015-05-14 21:07:23.111"),
-		AccessTime: parseTime("2015-05-14 21:07:24.222"),
-		ChangeTime: parseTime("2015-05-14 21:07:25.333"),
-	},
-	{
-		Name:       "testSymlink",
-		Type:       "symlink",
-		LinkTarget: "invalid",
-		UID:        uint32(os.Getuid()),
-		GID:        uint32(os.Getgid()),
-		Mode:       0777 | os.ModeSymlink,
-		ModTime:    parseTime("2015-05-14 21:07:23.111"),
-		AccessTime: parseTime("2015-05-14 21:07:24.222"),
-		ChangeTime: parseTime("2015-05-14 21:07:25.333"),
-	},
-
-	// include "testFile" and "testDir" again with slightly different
-	// metadata, so we can test if CreateAt works with pre-existing files.
-	{
-		Name:       "testFile",
-		Type:       "file",
-		Content:    restic.IDs{},
-		UID:        uint32(os.Getuid()),
-		GID:        uint32(os.Getgid()),
-		Mode:       0604,
-		ModTime:    parseTime("2005-05-14 21:07:03.111"),
-		AccessTime: parseTime("2005-05-14 21:07:04.222"),
-		ChangeTime: parseTime("2005-05-14 21:07:05.333"),
-	},
-	{
-		Name:       "testDir",
-		Type:       "dir",
-		Subtree:    nil,
-		UID:        uint32(os.Getuid()),
-		GID:        uint32(os.Getgid()),
-		Mode:       0750 | os.ModeDir,
-		ModTime:    parseTime("2005-05-14 21:07:03.111"),
-		AccessTime: parseTime("2005-05-14 21:07:04.222"),
-		ChangeTime: parseTime("2005-05-14 21:07:05.333"),
-	},
-	{
-		Name:       "testXattrFile",
-		Type:       "file",
-		Content:    restic.IDs{},
-		UID:        uint32(os.Getuid()),
-		GID:        uint32(os.Getgid()),
-		Mode:       0604,
-		ModTime:    parseTime("2005-05-14 21:07:03.111"),
-		AccessTime: parseTime("2005-05-14 21:07:04.222"),
-		ChangeTime: parseTime("2005-05-14 21:07:05.333"),
-		ExtendedAttributes: []restic.ExtendedAttribute{
-			{"user.foo", []byte("bar")},
-		},
-	},
-	{
-		Name:       "testXattrDir",
-		Type:       "dir",
-		Subtree:    nil,
-		UID:        uint32(os.Getuid()),
-		GID:        uint32(os.Getgid()),
-		Mode:       0750 | os.ModeDir,
-		ModTime:    parseTime("2005-05-14 21:07:03.111"),
-		AccessTime: parseTime("2005-05-14 21:07:04.222"),
-		ChangeTime: parseTime("2005-05-14 21:07:05.333"),
-		ExtendedAttributes: []restic.ExtendedAttribute{
-			{"user.foo", []byte("bar")},
-		},
-	},
-}
-
-func TestNodeRestoreAt(t *testing.T) {
-	tempdir := t.TempDir()
-
-	for _, test := range nodeTests {
-		t.Run("", func(t *testing.T) {
-			var nodePath string
-			if test.ExtendedAttributes != nil {
-				if runtime.GOOS == "windows" {
-					// restic does not support xattrs on windows
-					return
-				}
-
-				// tempdir might be backed by a filesystem that does not support
-				// extended attributes
-				nodePath = test.Name
-				defer func() {
-					_ = os.Remove(nodePath)
-				}()
-			} else {
-				nodePath = filepath.Join(tempdir, test.Name)
-			}
-			rtest.OK(t, test.CreateAt(context.TODO(), nodePath, nil))
-			rtest.OK(t, test.RestoreMetadata(nodePath))
-
-			if test.Type == "dir" {
-				rtest.OK(t, test.RestoreTimestamps(nodePath))
-			}
-
-			fi, err := os.Lstat(nodePath)
-			rtest.OK(t, err)
-
-			n2, err := restic.NodeFromFileInfo(nodePath, fi)
-			rtest.OK(t, err)
-
-			rtest.Assert(t, test.Name == n2.Name,
-				"%v: name doesn't match (%v != %v)", test.Type, test.Name, n2.Name)
-			rtest.Assert(t, test.Type == n2.Type,
-				"%v: type doesn't match (%v != %v)", test.Type, test.Type, n2.Type)
-			rtest.Assert(t, test.Size == n2.Size,
-				"%v: size doesn't match (%v != %v)", test.Size, test.Size, n2.Size)
-
-			if runtime.GOOS != "windows" {
-				rtest.Assert(t, test.UID == n2.UID,
-					"%v: UID doesn't match (%v != %v)", test.Type, test.UID, n2.UID)
-				rtest.Assert(t, test.GID == n2.GID,
-					"%v: GID doesn't match (%v != %v)", test.Type, test.GID, n2.GID)
-				if test.Type != "symlink" {
-					// On OpenBSD only root can set sticky bit (see sticky(8)).
-					if runtime.GOOS != "openbsd" && runtime.GOOS != "netbsd" && runtime.GOOS != "solaris" && test.Name == "testSticky" {
-						rtest.Assert(t, test.Mode == n2.Mode,
-							"%v: mode doesn't match (0%o != 0%o)", test.Type, test.Mode, n2.Mode)
-					}
-				}
-			}
-
-			AssertFsTimeEqual(t, "AccessTime", test.Type, test.AccessTime, n2.AccessTime)
-			AssertFsTimeEqual(t, "ModTime", test.Type, test.ModTime, n2.ModTime)
-			if len(n2.ExtendedAttributes) == 0 {
-				n2.ExtendedAttributes = nil
-			}
-			rtest.Assert(t, reflect.DeepEqual(test.ExtendedAttributes, n2.ExtendedAttributes),
-				"%v: xattrs don't match (%v != %v)", test.Name, test.ExtendedAttributes, n2.ExtendedAttributes)
-		})
-	}
-}
-
-func AssertFsTimeEqual(t *testing.T, label string, nodeType string, t1 time.Time, t2 time.Time) {
-	var equal bool
-
-	// Go currently doesn't support setting timestamps of symbolic links on darwin and bsd
-	if nodeType == "symlink" {
-		switch runtime.GOOS {
-		case "darwin", "freebsd", "openbsd", "netbsd", "solaris":
-			return
-		}
-	}
-
-	switch runtime.GOOS {
-	case "darwin":
-		// HFS+ timestamps don't support sub-second precision,
-		// see https://en.wikipedia.org/wiki/Comparison_of_file_systems
-		diff := int(t1.Sub(t2).Seconds())
-		equal = diff == 0
-	default:
-		equal = t1.Equal(t2)
-	}
-
-	rtest.Assert(t, equal, "%s: %s doesn't match (%v != %v)", label, nodeType, t1, t2)
-}
 
 func parseTimeNano(t testing.TB, s string) time.Time {
 	// 2006-01-02T15:04:05.999999999Z07:00
@@ -330,7 +52,7 @@ func TestFixTime(t *testing.T) {
 
 	for _, test := range tests {
 		t.Run("", func(t *testing.T) {
-			res := restic.FixTime(test.src)
+			res := FixTime(test.src)
 			if !res.Equal(test.want) {
 				t.Fatalf("wrong result for %v, want:\n  %v\ngot:\n  %v", test.src, test.want, res)
 			}
@@ -343,12 +65,12 @@ func TestSymlinkSerialization(t *testing.T) {
 		"válîd \t Üñi¢òde \n śẗŕinǵ",
 		string([]byte{0, 1, 2, 0xfa, 0xfb, 0xfc}),
 	} {
-		n := restic.Node{
+		n := Node{
 			LinkTarget: link,
 		}
 		ser, err := json.Marshal(n)
 		test.OK(t, err)
-		var n2 restic.Node
+		var n2 Node
 		err = json.Unmarshal(ser, &n2)
 		test.OK(t, err)
 		fmt.Println(string(ser))
@@ -365,7 +87,7 @@ func TestSymlinkSerializationFormat(t *testing.T) {
 		{`{"linktarget":"test"}`, "test"},
 		{`{"linktarget":"\u0000\u0001\u0002\ufffd\ufffd\ufffd","linktarget_raw":"AAEC+vv8"}`, string([]byte{0, 1, 2, 0xfa, 0xfb, 0xfc})},
 	} {
-		var n2 restic.Node
+		var n2 Node
 		err := json.Unmarshal([]byte(d.ser), &n2)
 		test.OK(t, err)
 		test.Equals(t, d.linkTarget, n2.LinkTarget)

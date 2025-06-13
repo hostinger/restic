@@ -2,12 +2,10 @@ package main
 
 import (
 	"context"
-	"os"
 	"path/filepath"
-	"strings"
-	"sync"
 	"time"
 
+	"github.com/restic/restic/hostinger"
 	"github.com/restic/restic/internal/debug"
 	"github.com/restic/restic/internal/errors"
 	"github.com/restic/restic/internal/filter"
@@ -18,124 +16,96 @@ import (
 	"github.com/restic/restic/internal/ui/termstatus"
 
 	"github.com/spf13/cobra"
+	"github.com/spf13/pflag"
 )
 
-var cmdRestore = &cobra.Command{
-	Use:   "restore [flags] snapshotID",
-	Short: "Extract the data from a snapshot",
-	Long: `
+func newRestoreCommand() *cobra.Command {
+	var opts RestoreOptions
+
+	cmd := &cobra.Command{
+		Use:   "restore [flags] snapshotID",
+		Short: "Extract the data from a snapshot",
+		Long: `
 The "restore" command extracts the data from a snapshot from the repository to
 a directory.
 
 The special snapshotID "latest" can be used to restore the latest snapshot in the
 repository.
 
-To only restore a specific subfolder, you can use the "<snapshotID>:<subfolder>"
+To only restore a specific subfolder, you can use the "snapshotID:subfolder"
 syntax, where "subfolder" is a path within the snapshot.
 
 EXIT STATUS
 ===========
 
-Exit status is 0 if the command was successful, and non-zero if there was any error.
+Exit status is 0 if the command was successful.
+Exit status is 1 if there was any error.
+Exit status is 10 if the repository does not exist.
+Exit status is 11 if the repository is already locked.
+Exit status is 12 if the password is incorrect.
 `,
-	DisableAutoGenTag: true,
-	RunE: func(cmd *cobra.Command, args []string) error {
-		ctx := cmd.Context()
-		var wg sync.WaitGroup
-		cancelCtx, cancel := context.WithCancel(ctx)
-		defer func() {
-			// shutdown termstatus
-			cancel()
-			wg.Wait()
-		}()
+		GroupID:           cmdGroupDefault,
+		DisableAutoGenTag: true,
+		RunE: func(cmd *cobra.Command, args []string) error {
+			term, cancel := setupTermstatus()
+			defer cancel()
+			return runRestore(cmd.Context(), opts, globalOptions, term, args)
+		},
+	}
 
-		term := termstatus.New(globalOptions.stdout, globalOptions.stderr, globalOptions.Quiet)
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
-			term.Run(cancelCtx)
-		}()
-
-		// allow usage of warnf / verbosef
-		prevStdout, prevStderr := globalOptions.stdout, globalOptions.stderr
-		defer func() {
-			globalOptions.stdout, globalOptions.stderr = prevStdout, prevStderr
-		}()
-		stdioWrapper := ui.NewStdioWrapper(term)
-		globalOptions.stdout, globalOptions.stderr = stdioWrapper.Stdout(), stdioWrapper.Stderr()
-
-		return runRestore(ctx, restoreOptions, globalOptions, term, args)
-	},
+	opts.AddFlags(cmd.Flags())
+	return cmd
 }
 
 // RestoreOptions collects all options for the restore command.
 type RestoreOptions struct {
-	Exclude            []string
-	InsensitiveExclude []string
-	Include            []string
-	InsensitiveInclude []string
-	Target             string
-	ScopeSymlinks      string
-
+	filter.ExcludePatternOptions
+	filter.IncludePatternOptions
+	Target string
 	restic.SnapshotFilter
-	Sparse bool
-	Verify bool
+	DryRun              bool
+	Sparse              bool
+	Verify              bool
+	Overwrite           restorer.OverwriteBehavior
+	Delete              bool
+	ExcludeXattrPattern []string
+	IncludeXattrPattern []string
+	ScopeSymlinks       string
 }
 
-var restoreOptions RestoreOptions
+func (opts *RestoreOptions) AddFlags(f *pflag.FlagSet) {
+	f.StringVarP(&opts.Target, "target", "t", "", "directory to extract data to")
 
-func init() {
-	cmdRoot.AddCommand(cmdRestore)
+	opts.ExcludePatternOptions.Add(f)
+	opts.IncludePatternOptions.Add(f)
 
-	flags := cmdRestore.Flags()
-	flags.StringArrayVarP(&restoreOptions.Exclude, "exclude", "e", nil, "exclude a `pattern` (can be specified multiple times)")
-	flags.StringArrayVar(&restoreOptions.InsensitiveExclude, "iexclude", nil, "same as --exclude but ignores the casing of `pattern`")
-	flags.StringArrayVarP(&restoreOptions.Include, "include", "i", nil, "include a `pattern`, exclude everything else (can be specified multiple times)")
-	flags.StringArrayVar(&restoreOptions.InsensitiveInclude, "iinclude", nil, "same as --include but ignores the casing of `pattern`")
-	flags.StringVarP(&restoreOptions.Target, "target", "t", "", "directory to extract data to")
-	flags.StringVar(&restoreOptions.ScopeSymlinks, "scope-symlinks", "", "do not extract symlinks that are targeting files outside this path")
+	f.StringArrayVar(&opts.ExcludeXattrPattern, "exclude-xattr", nil, "exclude xattr by `pattern` (can be specified multiple times)")
+	f.StringArrayVar(&opts.IncludeXattrPattern, "include-xattr", nil, "include xattr by `pattern` (can be specified multiple times)")
 
-	initSingleSnapshotFilter(flags, &restoreOptions.SnapshotFilter)
-	flags.BoolVar(&restoreOptions.Sparse, "sparse", false, "restore files as sparse")
-	flags.BoolVar(&restoreOptions.Verify, "verify", false, "verify restored files content")
+	initSingleSnapshotFilter(f, &opts.SnapshotFilter)
+	f.BoolVar(&opts.DryRun, "dry-run", false, "do not write any data, just show what would be done")
+	f.BoolVar(&opts.Sparse, "sparse", false, "restore files as sparse")
+	f.BoolVar(&opts.Verify, "verify", false, "verify restored files content")
+	f.Var(&opts.Overwrite, "overwrite", "overwrite behavior, one of (always|if-changed|if-newer|never)")
+	f.BoolVar(&opts.Delete, "delete", false, "delete files from target directory if they do not exist in snapshot. Use '--dry-run -vv' to check what would be deleted")
+	f.StringVar(&opts.ScopeSymlinks, "scope-symlinks", "", "do not extract symlinks that are targeting files outside this path")
 }
 
 func runRestore(ctx context.Context, opts RestoreOptions, gopts GlobalOptions,
 	term *termstatus.Terminal, args []string) error {
 
-	hasExcludes := len(opts.Exclude) > 0 || len(opts.InsensitiveExclude) > 0
-	hasIncludes := len(opts.Include) > 0 || len(opts.InsensitiveInclude) > 0
-	hasSymlinkScope := opts.ScopeSymlinks != ""
-
-	// Validate provided patterns
-	if len(opts.Exclude) > 0 {
-		if err := filter.ValidatePatterns(opts.Exclude); err != nil {
-			return errors.Fatalf("--exclude: %s", err)
-		}
-	}
-	if len(opts.InsensitiveExclude) > 0 {
-		if err := filter.ValidatePatterns(opts.InsensitiveExclude); err != nil {
-			return errors.Fatalf("--iexclude: %s", err)
-		}
-	}
-	if len(opts.Include) > 0 {
-		if err := filter.ValidatePatterns(opts.Include); err != nil {
-			return errors.Fatalf("--include: %s", err)
-		}
-	}
-	if len(opts.InsensitiveInclude) > 0 {
-		if err := filter.ValidatePatterns(opts.InsensitiveInclude); err != nil {
-			return errors.Fatalf("--iinclude: %s", err)
-		}
+	excludePatternFns, err := opts.ExcludePatternOptions.CollectPatterns(Warnf)
+	if err != nil {
+		return err
 	}
 
-	for i, str := range opts.InsensitiveExclude {
-		opts.InsensitiveExclude[i] = strings.ToLower(str)
+	includePatternFns, err := opts.IncludePatternOptions.CollectPatterns(Warnf)
+	if err != nil {
+		return err
 	}
 
-	for i, str := range opts.InsensitiveInclude {
-		opts.InsensitiveInclude[i] = strings.ToLower(str)
-	}
+	hasExcludes := len(excludePatternFns) > 0
+	hasIncludes := len(includePatternFns) > 0
 
 	switch {
 	case len(args) == 0:
@@ -152,29 +122,29 @@ func runRestore(ctx context.Context, opts RestoreOptions, gopts GlobalOptions,
 		return errors.Fatal("exclude and include patterns are mutually exclusive")
 	}
 
+	if opts.DryRun && opts.Verify {
+		return errors.Fatal("--dry-run and --verify are mutually exclusive")
+	}
+
+	if opts.Delete && filepath.Clean(opts.Target) == "/" && !hasExcludes && !hasIncludes {
+		return errors.Fatal("'--target / --delete' must be combined with an include or exclude filter")
+	}
+
 	snapshotIDString := args[0]
 
 	debug.Log("restore %v to %v", snapshotIDString, opts.Target)
 
-	repo, err := OpenRepository(ctx, gopts)
+	ctx, repo, unlock, err := openWithReadLock(ctx, gopts, gopts.NoLock)
 	if err != nil {
 		return err
 	}
-
-	if !gopts.NoLock {
-		var lock *restic.Lock
-		lock, ctx, err = lockRepo(ctx, repo, gopts.RetryLock, gopts.JSON)
-		defer unlockRepo(lock)
-		if err != nil {
-			return err
-		}
-	}
+	defer unlock()
 
 	sn, subfolder, err := (&restic.SnapshotFilter{
 		Hosts: opts.Hosts,
 		Paths: opts.Paths,
 		Tags:  opts.Tags,
-	}).FindLatest(ctx, repo.Backend(), repo, snapshotIDString)
+	}).FindLatest(ctx, repo, repo, snapshotIDString)
 	if err != nil {
 		return errors.Fatalf("failed to find snapshot: %v", err)
 	}
@@ -193,152 +163,94 @@ func runRestore(ctx context.Context, opts RestoreOptions, gopts GlobalOptions,
 	msg := ui.NewMessage(term, gopts.verbosity)
 	var printer restoreui.ProgressPrinter
 	if gopts.JSON {
-		printer = restoreui.NewJSONProgress(term)
+		printer = restoreui.NewJSONProgress(term, gopts.verbosity)
 	} else {
-		printer = restoreui.NewTextProgress(term)
+		printer = restoreui.NewTextProgress(term, gopts.verbosity)
 	}
 
 	progress := restoreui.NewProgress(printer, calculateProgressInterval(!gopts.Quiet, gopts.JSON))
-	res := restorer.NewRestorer(repo, sn, opts.Sparse, progress)
+	res := restorer.NewRestorer(repo, sn, restorer.Options{
+		DryRun:    opts.DryRun,
+		Sparse:    opts.Sparse,
+		Progress:  progress,
+		Overwrite: opts.Overwrite,
+		Delete:    opts.Delete,
+	})
 
 	totalErrors := 0
 	res.Error = func(location string, err error) error {
-		msg.E("ignoring error for %s: %s\n", location, err)
 		totalErrors++
-		return nil
+		return progress.Error(location, err)
+	}
+	res.Warn = func(message string) {
+		msg.E("Warning: %s\n", message)
+	}
+	res.Info = func(message string) {
+		if gopts.JSON {
+			return
+		}
+		msg.P("Info: %s\n", message)
 	}
 
-	excludePatterns := filter.ParsePatterns(opts.Exclude)
-	insensitiveExcludePatterns := filter.ParsePatterns(opts.InsensitiveExclude)
-	selectExcludeFilter := func(item string, dstpath string, node *restic.Node) (selectedForRestore bool, childMayBeSelected bool) {
-		matched, err := filter.List(excludePatterns, item)
-		if err != nil {
-			msg.E("error for exclude pattern: %v", err)
-		}
+	selectExcludeFilter := func(item string, isDir bool) (selectedForRestore bool, childMayBeSelected bool) {
+		matched := false
+		for _, rejectFn := range excludePatternFns {
+			matched = matched || rejectFn(item)
 
-		matchedInsensitive, err := filter.List(insensitiveExcludePatterns, strings.ToLower(item))
-		if err != nil {
-			msg.E("error for iexclude pattern: %v", err)
+			// implementing a short-circuit here to improve the performance
+			// to prevent additional pattern matching once the first pattern
+			// matches.
+			if matched {
+				break
+			}
 		}
-
 		// An exclude filter is basically a 'wildcard but foo',
 		// so even if a childMayMatch, other children of a dir may not,
 		// therefore childMayMatch does not matter, but we should not go down
 		// unless the dir is selected for restore
-		selectedForRestore = !matched && !matchedInsensitive
-		childMayBeSelected = selectedForRestore && node.Type == "dir"
+		selectedForRestore = !matched
+		childMayBeSelected = selectedForRestore && isDir
 
 		return selectedForRestore, childMayBeSelected
 	}
 
-	includePatterns := filter.ParsePatterns(opts.Include)
-	insensitiveIncludePatterns := filter.ParsePatterns(opts.InsensitiveInclude)
-	selectIncludeFilter := func(item string, dstpath string, node *restic.Node) (selectedForRestore bool, childMayBeSelected bool) {
-		matched, childMayMatch, err := filter.ListWithChild(includePatterns, item)
-		if err != nil {
-			msg.E("error for include pattern: %v", err)
-		}
+	selectIncludeFilter := func(item string, isDir bool) (selectedForRestore bool, childMayBeSelected bool) {
+		selectedForRestore = false
+		childMayBeSelected = false
+		for _, includeFn := range includePatternFns {
+			matched, childMayMatch := includeFn(item)
+			selectedForRestore = selectedForRestore || matched
+			childMayBeSelected = childMayBeSelected || childMayMatch
 
-		matchedInsensitive, childMayMatchInsensitive, err := filter.ListWithChild(insensitiveIncludePatterns, strings.ToLower(item))
-		if err != nil {
-			msg.E("error for iexclude pattern: %v", err)
+			if selectedForRestore && childMayBeSelected {
+				break
+			}
 		}
-
-		selectedForRestore = matched || matchedInsensitive
-		childMayBeSelected = (childMayMatch || childMayMatchInsensitive) && node.Type == "dir"
+		childMayBeSelected = childMayBeSelected && isDir
 
 		return selectedForRestore, childMayBeSelected
 	}
 
-	symlinkScope := opts.ScopeSymlinks
-	selectSymlinkScopeFilter := func(item string, dstpath string, node *restic.Node) (selectedForRestore bool, childMayBeSelected bool) {
-		childMayBeSelected = node.Type == "dir"
-
-		dstdir := filepath.Dir(dstpath)
-		// if dstdir already exists eval any symlinks it may contain
-		// and check if the path diverges from the scope
-		if _, err := os.Stat(dstdir); err == nil || !os.IsNotExist(err) {
-			evaldstdir, err := filepath.EvalSymlinks(dstdir)
-			if err != nil {
-				msg.E("error for destination eval symlink: %v", err)
-				return false, childMayBeSelected
-			}
-
-			if evaldstdir != dstdir {
-				if !strings.HasPrefix(evaldstdir, symlinkScope) && !strings.HasPrefix(symlinkScope, evaldstdir) {
-					debug.Log("destination dir %s is a outside scope %s", evaldstdir, symlinkScope)
-					return false, childMayBeSelected
-				}
-			}
-
-			dstdir = evaldstdir
-		}
-
-		// node.LinkTarget can be absolute (e.g. /var/test/target) or:
-		// 1. relative, with .. somewhere in the path (e.g. /var/test/target/next/..)
-		// 2. relative, starting with . (e.g. ./test/target)
-		//
-		// Need to clean node.LinkTarget to remove abundant relative path links:
-		//   /var/test/target/next/.. -> /var/test/target
-		//   ./test/target -> test/target
-		//
-		// The path can still be relative after Clean (e.g. ./var/../../target -> ../target)
-		// so we need to convert it to absolute with destination path in mind.
-		// To do this, select the top destination path element that is not a file
-		// and append the target to it:
-		//   /restore/test/symlink -> /restore/test/../target
-		//
-		// and then run Clean again to remove remaining relative path links:
-		//   /restore/test/../target -> /restore/target
-		if node.Type == "symlink" {
-			target := filepath.Clean(node.LinkTarget)
-			if !filepath.IsAbs(target) {
-				target = filepath.Clean(filepath.Join(dstdir, target))
-			}
-
-			if !strings.HasPrefix(target, symlinkScope) {
-				debug.Log("item %s is a symlink to %s which is outside of scope %s", item, target, symlinkScope)
-				return false, childMayBeSelected
-			}
-		} else {
-			target := filepath.Join(dstdir, filepath.Base(dstpath))
-			if !strings.HasPrefix(target, symlinkScope) && !strings.HasPrefix(symlinkScope, target) {
-				debug.Log("item %s leads to %s which is outside of scope %s", item, target, symlinkScope)
-				return false, childMayBeSelected
-			}
-		}
-
-		return true, childMayBeSelected
-	}
-
-	selectFilters := []func(item string, dstpath string, node *restic.Node) (selectedForRestore bool, childMayBeSelected bool){}
 	if hasExcludes {
-		selectFilters = append(selectFilters, selectExcludeFilter)
+		res.SelectFilter = selectExcludeFilter
 	} else if hasIncludes {
-		selectFilters = append(selectFilters, selectIncludeFilter)
+		res.SelectFilter = selectIncludeFilter
 	}
 
-	if hasSymlinkScope {
-		selectFilters = append(selectFilters, selectSymlinkScopeFilter)
+	if opts.ScopeSymlinks != "" {
+		res.NodeFilter = hostinger.SymlinkScopeNodeFilter(opts.ScopeSymlinks)
 	}
 
-	if len(selectFilters) > 0 {
-		res.SelectFilter = func(item string, dstpath string, node *restic.Node) (selectedForRestore bool, childMayBeSelected bool) {
-			for _, filter := range selectFilters {
-				selectedForRestore, childMayBeSelected = filter(item, dstpath, node)
-				if !selectedForRestore {
-					break
-				}
-			}
-			return selectedForRestore, childMayBeSelected
-		}
+	res.XattrSelectFilter, err = getXattrSelectFilter(opts)
+	if err != nil {
+		return err
 	}
 
 	if !gopts.JSON {
 		msg.P("restoring %s to %s\n", res.Snapshot(), opts.Target)
 	}
 
-	err = res.RestoreTo(ctx, opts.Target)
+	countRestoredFiles, err := res.RestoreTo(ctx, opts.Target)
 	if err != nil {
 		return err
 	}
@@ -355,7 +267,8 @@ func runRestore(ctx context.Context, opts RestoreOptions, gopts GlobalOptions,
 		}
 		var count int
 		t0 := time.Now()
-		count, err = res.VerifyFiles(ctx, opts.Target)
+		bar := newTerminalProgressMax(!gopts.Quiet && !gopts.JSON && stdoutIsTerminal(), 0, "files verified", term)
+		count, err = res.VerifyFiles(ctx, opts.Target, countRestoredFiles, bar)
 		if err != nil {
 			return err
 		}
@@ -370,4 +283,39 @@ func runRestore(ctx context.Context, opts RestoreOptions, gopts GlobalOptions,
 	}
 
 	return nil
+}
+
+func getXattrSelectFilter(opts RestoreOptions) (func(xattrName string) bool, error) {
+	hasXattrExcludes := len(opts.ExcludeXattrPattern) > 0
+	hasXattrIncludes := len(opts.IncludeXattrPattern) > 0
+
+	if hasXattrExcludes && hasXattrIncludes {
+		return nil, errors.Fatal("exclude and include xattr patterns are mutually exclusive")
+	}
+
+	if hasXattrExcludes {
+		if err := filter.ValidatePatterns(opts.ExcludeXattrPattern); err != nil {
+			return nil, errors.Fatalf("--exclude-xattr: %s", err)
+		}
+
+		return func(xattrName string) bool {
+			shouldReject := filter.RejectByPattern(opts.ExcludeXattrPattern, Warnf)(xattrName)
+			return !shouldReject
+		}, nil
+	}
+
+	if hasXattrIncludes {
+		// User has either input include xattr pattern(s) or we're using our default include pattern
+		if err := filter.ValidatePatterns(opts.IncludeXattrPattern); err != nil {
+			return nil, errors.Fatalf("--include-xattr: %s", err)
+		}
+
+		return func(xattrName string) bool {
+			shouldInclude, _ := filter.IncludeByPattern(opts.IncludeXattrPattern, Warnf)(xattrName)
+			return shouldInclude
+		}, nil
+	}
+
+	// default to including all xattrs
+	return func(_ string) bool { return true }, nil
 }

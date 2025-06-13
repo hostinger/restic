@@ -3,24 +3,27 @@ package azure
 import (
 	"os"
 	"path"
+	"strconv"
 	"strings"
 
+	"github.com/restic/restic/internal/backend"
 	"github.com/restic/restic/internal/errors"
 	"github.com/restic/restic/internal/options"
-	"github.com/restic/restic/internal/restic"
 )
 
 // Config contains all configuration necessary to connect to an azure compatible
 // server.
 type Config struct {
-	AccountName    string
-	AccountSAS     options.SecretString
-	AccountKey     options.SecretString
-	EndpointSuffix string
-	Container      string
-	Prefix         string
+	AccountName        string
+	AccountSAS         options.SecretString
+	AccountKey         options.SecretString
+	ForceCliCredential bool
+	EndpointSuffix     string
+	Container          string
+	Prefix             string
 
-	Connections uint `option:"connections" help:"set a limit for the number of concurrent connections (default: 5)"`
+	Connections uint   `option:"connections" help:"set a limit for the number of concurrent connections (default: 5)"`
+	AccessTier  string `option:"access-tier" help:"set the access tier for the blob storage (default: inferred from the storage account defaults)"`
 }
 
 // NewConfig returns a new Config with the default values filled in.
@@ -57,7 +60,7 @@ func ParseConfig(s string) (*Config, error) {
 	return &cfg, nil
 }
 
-var _ restic.ApplyEnvironmenter = &Config{}
+var _ backend.ApplyEnvironmenter = &Config{}
 
 // ApplyEnvironment saves values from the environment to the config.
 func (cfg *Config) ApplyEnvironment(prefix string) {
@@ -71,6 +74,11 @@ func (cfg *Config) ApplyEnvironment(prefix string) {
 
 	if cfg.AccountSAS.String() == "" {
 		cfg.AccountSAS = options.NewSecretString(os.Getenv(prefix + "AZURE_ACCOUNT_SAS"))
+	}
+
+	var forceCliCred, err = strconv.ParseBool(os.Getenv(prefix + "AZURE_FORCE_CLI_CREDENTIAL"))
+	if err == nil {
+		cfg.ForceCliCredential = forceCliCred
 	}
 
 	if cfg.EndpointSuffix == "" {

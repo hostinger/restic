@@ -3,18 +3,21 @@ package main
 import (
 	"context"
 
-	"github.com/restic/restic/internal/backend"
 	"github.com/restic/restic/internal/errors"
 	"github.com/restic/restic/internal/restic"
 	"github.com/restic/restic/internal/walker"
 
 	"github.com/spf13/cobra"
+	"github.com/spf13/pflag"
 )
 
-var cmdRepairSnapshots = &cobra.Command{
-	Use:   "snapshots [flags] [snapshot ID] [...]",
-	Short: "Repair snapshots",
-	Long: `
+func newRepairSnapshotsCommand() *cobra.Command {
+	var opts RepairOptions
+
+	cmd := &cobra.Command{
+		Use:   "snapshots [flags] [snapshot ID] [...]",
+		Short: "Repair snapshots",
+		Long: `
 The "repair snapshots" command repairs broken snapshots. It scans the given
 snapshots and generates new ones with damaged directories and file contents
 removed. If the broken snapshots are deleted, a prune run will be able to
@@ -38,12 +41,20 @@ snapshot!
 EXIT STATUS
 ===========
 
-Exit status is 0 if the command was successful, and non-zero if there was any error.
+Exit status is 0 if the command was successful.
+Exit status is 1 if there was any error.
+Exit status is 10 if the repository does not exist.
+Exit status is 11 if the repository is already locked.
+Exit status is 12 if the password is incorrect.
 `,
-	DisableAutoGenTag: true,
-	RunE: func(cmd *cobra.Command, args []string) error {
-		return runRepairSnapshots(cmd.Context(), globalOptions, repairSnapshotOptions, args)
-	},
+		DisableAutoGenTag: true,
+		RunE: func(cmd *cobra.Command, args []string) error {
+			return runRepairSnapshots(cmd.Context(), globalOptions, opts, args)
+		},
+	}
+
+	opts.AddFlags(cmd.Flags())
+	return cmd
 }
 
 // RepairOptions collects all options for the repair command.
@@ -54,37 +65,21 @@ type RepairOptions struct {
 	restic.SnapshotFilter
 }
 
-var repairSnapshotOptions RepairOptions
+func (opts *RepairOptions) AddFlags(f *pflag.FlagSet) {
+	f.BoolVarP(&opts.DryRun, "dry-run", "n", false, "do not do anything, just print what would be done")
+	f.BoolVarP(&opts.Forget, "forget", "", false, "remove original snapshots after creating new ones")
 
-func init() {
-	cmdRepair.AddCommand(cmdRepairSnapshots)
-	flags := cmdRepairSnapshots.Flags()
-
-	flags.BoolVarP(&repairSnapshotOptions.DryRun, "dry-run", "n", false, "do not do anything, just print what would be done")
-	flags.BoolVarP(&repairSnapshotOptions.Forget, "forget", "", false, "remove original snapshots after creating new ones")
-
-	initMultiSnapshotFilter(flags, &repairSnapshotOptions.SnapshotFilter, true)
+	initMultiSnapshotFilter(f, &opts.SnapshotFilter, true)
 }
 
 func runRepairSnapshots(ctx context.Context, gopts GlobalOptions, opts RepairOptions, args []string) error {
-	repo, err := OpenRepository(ctx, gopts)
+	ctx, repo, unlock, err := openWithExclusiveLock(ctx, gopts, opts.DryRun)
 	if err != nil {
 		return err
 	}
+	defer unlock()
 
-	if !opts.DryRun {
-		var lock *restic.Lock
-		var err error
-		lock, ctx, err = lockRepoExclusive(ctx, repo, gopts.RetryLock, gopts.JSON)
-		defer unlockRepo(lock)
-		if err != nil {
-			return err
-		}
-	} else {
-		repo.SetDryRun()
-	}
-
-	snapshotLister, err := backend.MemorizeList(ctx, repo.Backend(), restic.SnapshotFile)
+	snapshotLister, err := restic.MemorizeList(ctx, repo, restic.SnapshotFile)
 	if err != nil {
 		return err
 	}
@@ -100,16 +95,20 @@ func runRepairSnapshots(ctx context.Context, gopts GlobalOptions, opts RepairOpt
 	// - files whose contents are not fully available  (-> file will be modified)
 	rewriter := walker.NewTreeRewriter(walker.RewriteOpts{
 		RewriteNode: func(node *restic.Node, path string) *restic.Node {
-			if node.Type != "file" {
+			if node.Type == restic.NodeTypeIrregular || node.Type == restic.NodeTypeInvalid {
+				Verbosef("  file %q: removed node with invalid type %q\n", path, node.Type)
+				return nil
+			}
+			if node.Type != restic.NodeTypeFile {
 				return node
 			}
 
 			ok := true
-			var newContent restic.IDs = restic.IDs{}
+			var newContent = restic.IDs{}
 			var newSize uint64
 			// check all contents and remove if not available
 			for _, id := range node.Content {
-				if size, found := repo.LookupBlobSize(id, restic.DataBlob); !found {
+				if size, found := repo.LookupBlobSize(restic.DataBlob, id); !found {
 					ok = false
 				} else {
 					newContent = append(newContent, id)
@@ -126,7 +125,7 @@ func runRepairSnapshots(ctx context.Context, gopts GlobalOptions, opts RepairOpt
 			node.Size = newSize
 			return node
 		},
-		RewriteFailedTree: func(nodeID restic.ID, path string, _ error) (restic.ID, error) {
+		RewriteFailedTree: func(_ restic.ID, path string, _ error) (restic.ID, error) {
 			if path == "/" {
 				Verbosef("  dir %q: not readable\n", path)
 				// remove snapshots with invalid root node
@@ -145,17 +144,21 @@ func runRepairSnapshots(ctx context.Context, gopts GlobalOptions, opts RepairOpt
 
 	changedCount := 0
 	for sn := range FindFilteredSnapshots(ctx, snapshotLister, repo, &opts.SnapshotFilter, args) {
-		Verbosef("\nsnapshot %s of %v at %s)\n", sn.ID().Str(), sn.Paths, sn.Time)
+		Verbosef("\n%v\n", sn)
 		changed, err := filterAndReplaceSnapshot(ctx, repo, sn,
-			func(ctx context.Context, sn *restic.Snapshot) (restic.ID, error) {
-				return rewriter.RewriteTree(ctx, repo, "/", *sn.Tree)
-			}, opts.DryRun, opts.Forget, "repaired")
+			func(ctx context.Context, sn *restic.Snapshot) (restic.ID, *restic.SnapshotSummary, error) {
+				id, err := rewriter.RewriteTree(ctx, repo, "/", *sn.Tree)
+				return id, nil, err
+			}, opts.DryRun, opts.Forget, nil, "repaired")
 		if err != nil {
 			return errors.Fatalf("unable to rewrite snapshot ID %q: %v", sn.ID().Str(), err)
 		}
 		if changed {
 			changedCount++
 		}
+	}
+	if ctx.Err() != nil {
+		return ctx.Err()
 	}
 
 	Verbosef("\n")

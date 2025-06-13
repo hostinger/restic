@@ -2,28 +2,29 @@ package archiver
 
 import (
 	"context"
+	"fmt"
 
 	"github.com/restic/restic/internal/debug"
 	"github.com/restic/restic/internal/restic"
 	"golang.org/x/sync/errgroup"
 )
 
-// Saver allows saving a blob.
-type Saver interface {
+// saver allows saving a blob.
+type saver interface {
 	SaveBlob(ctx context.Context, t restic.BlobType, data []byte, id restic.ID, storeDuplicate bool) (restic.ID, bool, int, error)
 }
 
-// BlobSaver concurrently saves incoming blobs to the repo.
-type BlobSaver struct {
-	repo Saver
+// blobSaver concurrently saves incoming blobs to the repo.
+type blobSaver struct {
+	repo saver
 	ch   chan<- saveBlobJob
 }
 
-// NewBlobSaver returns a new blob. A worker pool is started, it is stopped
+// newBlobSaver returns a new blob. A worker pool is started, it is stopped
 // when ctx is cancelled.
-func NewBlobSaver(ctx context.Context, wg *errgroup.Group, repo Saver, workers uint) *BlobSaver {
+func newBlobSaver(ctx context.Context, wg *errgroup.Group, repo saver, workers uint) *blobSaver {
 	ch := make(chan saveBlobJob)
-	s := &BlobSaver{
+	s := &blobSaver{
 		repo: repo,
 		ch:   ch,
 	}
@@ -37,15 +38,15 @@ func NewBlobSaver(ctx context.Context, wg *errgroup.Group, repo Saver, workers u
 	return s
 }
 
-func (s *BlobSaver) TriggerShutdown() {
+func (s *blobSaver) TriggerShutdown() {
 	close(s.ch)
 }
 
 // Save stores a blob in the repo. It checks the index and the known blobs
 // before saving anything. It takes ownership of the buffer passed in.
-func (s *BlobSaver) Save(ctx context.Context, t restic.BlobType, buf *Buffer, cb func(res SaveBlobResponse)) {
+func (s *blobSaver) Save(ctx context.Context, t restic.BlobType, buf *buffer, filename string, cb func(res saveBlobResponse)) {
 	select {
-	case s.ch <- saveBlobJob{BlobType: t, buf: buf, cb: cb}:
+	case s.ch <- saveBlobJob{BlobType: t, buf: buf, fn: filename, cb: cb}:
 	case <-ctx.Done():
 		debug.Log("not sending job, context is cancelled")
 	}
@@ -53,25 +54,26 @@ func (s *BlobSaver) Save(ctx context.Context, t restic.BlobType, buf *Buffer, cb
 
 type saveBlobJob struct {
 	restic.BlobType
-	buf *Buffer
-	cb  func(res SaveBlobResponse)
+	buf *buffer
+	fn  string
+	cb  func(res saveBlobResponse)
 }
 
-type SaveBlobResponse struct {
+type saveBlobResponse struct {
 	id         restic.ID
 	length     int
 	sizeInRepo int
 	known      bool
 }
 
-func (s *BlobSaver) saveBlob(ctx context.Context, t restic.BlobType, buf []byte) (SaveBlobResponse, error) {
+func (s *blobSaver) saveBlob(ctx context.Context, t restic.BlobType, buf []byte) (saveBlobResponse, error) {
 	id, known, sizeInRepo, err := s.repo.SaveBlob(ctx, t, buf, restic.ID{}, false)
 
 	if err != nil {
-		return SaveBlobResponse{}, err
+		return saveBlobResponse{}, err
 	}
 
-	return SaveBlobResponse{
+	return saveBlobResponse{
 		id:         id,
 		length:     len(buf),
 		sizeInRepo: sizeInRepo,
@@ -79,7 +81,7 @@ func (s *BlobSaver) saveBlob(ctx context.Context, t restic.BlobType, buf []byte)
 	}, nil
 }
 
-func (s *BlobSaver) worker(ctx context.Context, jobs <-chan saveBlobJob) error {
+func (s *blobSaver) worker(ctx context.Context, jobs <-chan saveBlobJob) error {
 	for {
 		var job saveBlobJob
 		var ok bool
@@ -95,7 +97,7 @@ func (s *BlobSaver) worker(ctx context.Context, jobs <-chan saveBlobJob) error {
 		res, err := s.saveBlob(ctx, job.BlobType, job.buf.Data)
 		if err != nil {
 			debug.Log("saveBlob returned error, exiting: %v", err)
-			return err
+			return fmt.Errorf("failed to save blob from file %q: %w", job.fn, err)
 		}
 		job.cb(res)
 		job.buf.Release()

@@ -31,7 +31,7 @@ var opts = struct {
 var versionRegex = regexp.MustCompile(`^\d+\.\d+\.\d+$`)
 
 func init() {
-	pflag.BoolVar(&opts.IgnoreBranchName, "ignore-branch-name", false, "allow releasing from other branches as 'master'")
+	pflag.BoolVar(&opts.IgnoreBranchName, "ignore-branch-name", false, "allow releasing from other branches than 'master'")
 	pflag.BoolVar(&opts.IgnoreUncommittedChanges, "ignore-uncommitted-changes", false, "allow uncommitted changes")
 	pflag.BoolVar(&opts.IgnoreChangelogVersion, "ignore-changelog-version", false, "ignore missing entry in CHANGELOG.md")
 	pflag.BoolVar(&opts.IgnoreChangelogReleaseDate, "ignore-changelog-release-date", false, "ignore missing subdir with date in changelog/")
@@ -128,17 +128,22 @@ func uncommittedChanges(dirs ...string) string {
 	return string(changes)
 }
 
-func preCheckBranchMaster() {
-	if opts.IgnoreBranchName {
-		return
-	}
-
+func getBranchName() string {
 	branch, err := exec.Command("git", "rev-parse", "--abbrev-ref", "HEAD").Output()
 	if err != nil {
 		die("error running 'git': %v", err)
 	}
 
-	if strings.TrimSpace(string(branch)) != "master" {
+	return strings.TrimSpace(string(branch))
+}
+
+func preCheckBranchMaster() {
+	if opts.IgnoreBranchName {
+		return
+	}
+
+	branch := getBranchName()
+	if branch != "master" {
 		die("wrong branch: %s", branch)
 	}
 }
@@ -323,7 +328,12 @@ func updateVersion() {
 }
 
 func updateVersionDev() {
-	newVersion := fmt.Sprintf(`var version = "%s-dev (compiled by jokūbas)"`, opts.Version)
+	err := os.WriteFile("VERSION", []byte(opts.Version+"-dev\n"), 0644)
+	if err != nil {
+		die("unable to write version to file: %v", err)
+	}
+
+	newVersion := fmt.Sprintf(`var version = "%s-dev (compiled manually)"`, opts.Version)
 	replace(versionCodeFile, versionPattern, newVersion)
 
 	msg("committing cmd/restic/global.go with dev version")
@@ -379,7 +389,7 @@ func readdir(dir string) []string {
 }
 
 func sha256sums(inputDir, outputFile string) {
-	msg("runnnig sha256sum in %v", inputDir)
+	msg("running sha256sum in %v", inputDir)
 
 	filenames := readdir(inputDir)
 
@@ -444,6 +454,7 @@ func main() {
 	}
 
 	preCheckBranchMaster()
+	branch := getBranchName()
 	preCheckUncommittedChanges()
 	preCheckVersionExists()
 	preCheckDockerBuilderGoVersion()
@@ -480,5 +491,5 @@ func main() {
 
 	msg("done, output dir is %v", opts.OutputDir)
 
-	msg("now run:\n\ngit push --tags origin master\n%s\n\nrm -rf %q", dockerCmds, sourceDir)
+	msg("now run:\n\ngit push --tags origin %s\n%s\n\nrm -rf %q", branch, dockerCmds, sourceDir)
 }

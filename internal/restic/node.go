@@ -1,35 +1,89 @@
 package restic
 
 import (
-	"context"
+	"bytes"
 	"encoding/json"
 	"fmt"
 	"os"
-	"os/user"
+	"reflect"
 	"strconv"
+	"strings"
 	"sync"
-	"syscall"
 	"time"
 	"unicode/utf8"
 
 	"github.com/restic/restic/internal/errors"
 
-	"bytes"
-
 	"github.com/restic/restic/internal/debug"
-	"github.com/restic/restic/internal/fs"
 )
 
-// ExtendedAttribute is a tuple storing the xattr name and value.
+// ExtendedAttribute is a tuple storing the xattr name and value for various filesystems.
 type ExtendedAttribute struct {
 	Name  string `json:"name"`
 	Value []byte `json:"value"`
 }
 
+// GenericAttributeType can be used for OS specific functionalities by defining specific types
+// in node.go to be used by the specific node_xx files.
+// OS specific attribute types should follow the convention <OS>Attributes.
+// GenericAttributeTypes should follow the convention <OS specific attribute type>.<attribute name>
+// The attributes in OS specific attribute types must be pointers as we want to distinguish nil values
+// and not create GenericAttributes for them.
+type GenericAttributeType string
+
+// OSType is the type created to represent each specific OS
+type OSType string
+
+const (
+	// When new GenericAttributeType are defined, they must be added in the init function as well.
+
+	// Below are windows specific attributes.
+
+	// TypeCreationTime is the GenericAttributeType used for storing creation time for windows files within the generic attributes map.
+	TypeCreationTime GenericAttributeType = "windows.creation_time"
+	// TypeFileAttributes is the GenericAttributeType used for storing file attributes for windows files within the generic attributes map.
+	TypeFileAttributes GenericAttributeType = "windows.file_attributes"
+	// TypeSecurityDescriptor is the GenericAttributeType used for storing security descriptors including owner, group, discretionary access control list (DACL), system access control list (SACL)) for windows files within the generic attributes map.
+	TypeSecurityDescriptor GenericAttributeType = "windows.security_descriptor"
+
+	// Generic Attributes for other OS types should be defined here.
+)
+
+// init is called when the package is initialized. Any new GenericAttributeTypes being created must be added here as well.
+func init() {
+	storeGenericAttributeType(TypeCreationTime, TypeFileAttributes, TypeSecurityDescriptor)
+}
+
+// genericAttributesForOS maintains a map of known genericAttributesForOS to the OSType
+var genericAttributesForOS = map[GenericAttributeType]OSType{}
+
+// storeGenericAttributeType adds and entry in genericAttributesForOS map
+func storeGenericAttributeType(attributeTypes ...GenericAttributeType) {
+	for _, attributeType := range attributeTypes {
+		// Get the OS attribute type from the GenericAttributeType
+		osAttributeName := strings.Split(string(attributeType), ".")[0]
+		genericAttributesForOS[attributeType] = OSType(osAttributeName)
+	}
+}
+
+type NodeType string
+
+var (
+	NodeTypeFile      = NodeType("file")
+	NodeTypeDir       = NodeType("dir")
+	NodeTypeSymlink   = NodeType("symlink")
+	NodeTypeDev       = NodeType("dev")
+	NodeTypeCharDev   = NodeType("chardev")
+	NodeTypeFifo      = NodeType("fifo")
+	NodeTypeSocket    = NodeType("socket")
+	NodeTypeIrregular = NodeType("irregular")
+	NodeTypeInvalid   = NodeType("")
+)
+
 // Node is a file, directory or other item in a backup.
 type Node struct {
 	Name       string      `json:"name"`
-	Type       string      `json:"type"`
+	Type       NodeType    `json:"type"`
 	Mode       os.FileMode `json:"mode,omitempty"`
 	ModTime    time.Time   `json:"mtime,omitempty"`
 	AccessTime time.Time   `json:"atime,omitempty"`
@@ -39,7 +93,7 @@ type Node struct {
 	User       string      `json:"user,omitempty"`
 	Group      string      `json:"group,omitempty"`
 	Inode      uint64      `json:"inode,omitempty"`
-	DeviceID   uint64      `json:"device_id,omitempty"` // device id of the file, stat.st_dev
+	DeviceID   uint64      `json:"device_id,omitempty"` // device id of the file, stat.st_dev, only stored for hardlinks
 	Size       uint64      `json:"size,omitempty"`
 	Links      uint64      `json:"links,omitempty"`
 	LinkTarget string      `json:"linktarget,omitempty"`
@@ -47,11 +101,12 @@ type Node struct {
 	// This allows storing arbitrary byte-sequences, which are possible as symlink targets on unix systems,
 	// as LinkTarget without breaking backwards-compatibility.
 	// Must only be set of the linktarget cannot be encoded as valid utf8.
-	LinkTargetRaw      []byte              `json:"linktarget_raw,omitempty"`
-	ExtendedAttributes []ExtendedAttribute `json:"extended_attributes,omitempty"`
-	Device             uint64              `json:"device,omitempty"` // in case of Type == "dev", stat.st_rdev
-	Content            IDs                 `json:"content"`
-	Subtree            *ID                 `json:"subtree,omitempty"`
+	LinkTargetRaw      []byte                                   `json:"linktarget_raw,omitempty"`
+	ExtendedAttributes []ExtendedAttribute                      `json:"extended_attributes,omitempty"`
+	GenericAttributes  map[GenericAttributeType]json.RawMessage `json:"generic_attributes,omitempty"`
+	Device             uint64                                   `json:"device,omitempty"` // in case of Type == "dev", stat.st_rdev
+	Content            IDs                                      `json:"content"`
+	Subtree            *ID                                      `json:"subtree,omitempty"`
 
 	Error string `json:"error,omitempty"`
 
@@ -68,65 +123,24 @@ func (n Nodes) Swap(i, j int)      { n[i], n[j] = n[j], n[i] }
 func (node Node) String() string {
 	var mode os.FileMode
 	switch node.Type {
-	case "file":
+	case NodeTypeFile:
 		mode = 0
-	case "dir":
+	case NodeTypeDir:
 		mode = os.ModeDir
-	case "symlink":
+	case NodeTypeSymlink:
 		mode = os.ModeSymlink
-	case "dev":
+	case NodeTypeDev:
 		mode = os.ModeDevice
-	case "chardev":
+	case NodeTypeCharDev:
 		mode = os.ModeDevice | os.ModeCharDevice
-	case "fifo":
+	case NodeTypeFifo:
 		mode = os.ModeNamedPipe
-	case "socket":
+	case NodeTypeSocket:
 		mode = os.ModeSocket
 	}
 
 	return fmt.Sprintf("%s %5d %5d %6d %s %s",
 		mode|node.Mode, node.UID, node.GID, node.Size, node.ModTime, node.Name)
-}
-
-// NodeFromFileInfo returns a new node from the given path and FileInfo. It
-// returns the first error that is encountered, together with a node.
-func NodeFromFileInfo(path string, fi os.FileInfo) (*Node, error) {
-	mask := os.ModePerm | os.ModeType | os.ModeSetuid | os.ModeSetgid | os.ModeSticky
-	node := &Node{
-		Path:    path,
-		Name:    fi.Name(),
-		Mode:    fi.Mode() & mask,
-		ModTime: fi.ModTime(),
-	}
-
-	node.Type = nodeTypeFromFileInfo(fi)
-	if node.Type == "file" {
-		node.Size = uint64(fi.Size())
-	}
-
-	err := node.fillExtra(path, fi)
-	return node, err
-}
-
-func nodeTypeFromFileInfo(fi os.FileInfo) string {
-	switch fi.Mode() & (os.ModeType | os.ModeCharDevice) {
-	case 0:
-		return "file"
-	case os.ModeDir:
-		return "dir"
-	case os.ModeSymlink:
-		return "symlink"
-	case os.ModeDevice | os.ModeCharDevice:
-		return "chardev"
-	case os.ModeDevice:
-		return "dev"
-	case os.ModeNamedPipe:
-		return "fifo"
-	case os.ModeSocket:
-		return "socket"
-	}
-
-	return ""
 }
 
 // GetExtendedAttribute gets the extended attribute.
@@ -137,191 +151,6 @@ func (node Node) GetExtendedAttribute(a string) []byte {
 		}
 	}
 	return nil
-}
-
-// CreateAt creates the node at the given path but does NOT restore node meta data.
-func (node *Node) CreateAt(ctx context.Context, path string, repo Repository) error {
-	debug.Log("create node %v at %v", node.Name, path)
-
-	switch node.Type {
-	case "dir":
-		if err := node.createDirAt(path); err != nil {
-			return err
-		}
-	case "file":
-		if err := node.createFileAt(ctx, path, repo); err != nil {
-			return err
-		}
-	case "symlink":
-		if err := node.createSymlinkAt(path); err != nil {
-			return err
-		}
-	case "dev":
-		if err := node.createDevAt(path); err != nil {
-			return err
-		}
-	case "chardev":
-		if err := node.createCharDevAt(path); err != nil {
-			return err
-		}
-	case "fifo":
-		if err := node.createFifoAt(path); err != nil {
-			return err
-		}
-	case "socket":
-		return nil
-	default:
-		return errors.Errorf("filetype %q not implemented", node.Type)
-	}
-
-	return nil
-}
-
-// RestoreMetadata restores node metadata
-func (node Node) RestoreMetadata(path string) error {
-	err := node.restoreMetadata(path)
-	if err != nil {
-		debug.Log("restoreMetadata(%s) error %v", path, err)
-	}
-
-	return err
-}
-
-func (node Node) restoreMetadata(path string) error {
-	var firsterr error
-
-	if err := lchown(path, int(node.UID), int(node.GID)); err != nil {
-		// Like "cp -a" and "rsync -a" do, we only report lchown permission errors
-		// if we run as root.
-		if os.Geteuid() > 0 && os.IsPermission(err) {
-			debug.Log("not running as root, ignoring lchown permission error for %v: %v",
-				path, err)
-		} else {
-			firsterr = errors.WithStack(err)
-		}
-	}
-
-	if node.Type != "symlink" {
-		if err := fs.Chmod(path, node.Mode); err != nil {
-			if firsterr != nil {
-				firsterr = errors.WithStack(err)
-			}
-		}
-	}
-
-	if err := node.RestoreTimestamps(path); err != nil {
-		debug.Log("error restoring timestamps for dir %v: %v", path, err)
-		if firsterr != nil {
-			firsterr = err
-		}
-	}
-
-	if err := node.restoreExtendedAttributes(path); err != nil {
-		debug.Log("error restoring extended attributes for %v: %v", path, err)
-		if firsterr != nil {
-			firsterr = err
-		}
-	}
-
-	return firsterr
-}
-
-func (node Node) restoreExtendedAttributes(path string) error {
-	for _, attr := range node.ExtendedAttributes {
-		err := Setxattr(path, attr.Name, attr.Value)
-		if err != nil {
-			return err
-		}
-	}
-	return nil
-}
-
-func (node Node) RestoreTimestamps(path string) error {
-	var utimes = [...]syscall.Timespec{
-		syscall.NsecToTimespec(node.AccessTime.UnixNano()),
-		syscall.NsecToTimespec(node.ModTime.UnixNano()),
-	}
-
-	if node.Type == "symlink" {
-		return node.restoreSymlinkTimestamps(path, utimes)
-	}
-
-	if err := syscall.UtimesNano(path, utimes[:]); err != nil {
-		return errors.Wrap(err, "UtimesNano")
-	}
-
-	return nil
-}
-
-func (node Node) createDirAt(path string) error {
-	err := fs.Mkdir(path, node.Mode)
-	if err != nil && !os.IsExist(err) {
-		return errors.WithStack(err)
-	}
-
-	return nil
-}
-
-func (node Node) createFileAt(ctx context.Context, path string, repo Repository) error {
-	f, err := fs.OpenFile(path, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0600)
-	if err != nil {
-		return errors.WithStack(err)
-	}
-
-	err = node.writeNodeContent(ctx, repo, f)
-	closeErr := f.Close()
-
-	if err != nil {
-		return err
-	}
-
-	if closeErr != nil {
-		return errors.WithStack(closeErr)
-	}
-
-	return nil
-}
-
-func (node Node) writeNodeContent(ctx context.Context, repo Repository, f *os.File) error {
-	var buf []byte
-	for _, id := range node.Content {
-		buf, err := repo.LoadBlob(ctx, DataBlob, id, buf)
-		if err != nil {
-			return err
-		}
-
-		_, err = f.Write(buf)
-		if err != nil {
-			return errors.WithStack(err)
-		}
-	}
-
-	return nil
-}
-
-func (node Node) createSymlinkAt(path string) error {
-
-	if err := os.Remove(path); err != nil && !errors.Is(err, os.ErrNotExist) {
-		return errors.Wrap(err, "Symlink")
-	}
-
-	if err := fs.Symlink(node.LinkTarget, path); err != nil {
-		return errors.WithStack(err)
-	}
-
-	return nil
-}
-
-func (node *Node) createDevAt(path string) error {
-	return mknod(path, syscall.S_IFBLK|0600, node.Device)
-}
-
-func (node *Node) createCharDevAt(path string) error {
-	return mknod(path, syscall.S_IFCHR|0600, node.Device)
-}
-
-func (node *Node) createFifoAt(path string) error {
-	return mkfifo(path, 0600)
 }
 
 // FixTime returns a time.Time which can safely be used to marshal as JSON. If
@@ -436,6 +265,9 @@ func (node Node) Equals(other Node) bool {
 	if !node.sameExtendedAttributes(other) {
 		return false
 	}
+	if !node.sameGenericAttributes(other) {
+		return false
+	}
 	if node.Subtree != nil {
 		if other.Subtree == nil {
 			return false
@@ -478,8 +310,13 @@ func (node Node) sameContent(other Node) bool {
 }
 
 func (node Node) sameExtendedAttributes(other Node) bool {
-	if len(node.ExtendedAttributes) != len(other.ExtendedAttributes) {
+	ln := len(node.ExtendedAttributes)
+	lo := len(other.ExtendedAttributes)
+	if ln != lo {
 		return false
+	} else if ln == 0 {
+		// This means lo is also of length 0
+		return true
 	}
 
 	// build a set of all attributes that node has
@@ -523,143 +360,141 @@ func (node Node) sameExtendedAttributes(other Node) bool {
 	return true
 }
 
-func (node *Node) fillUser(stat *statT) {
-	uid, gid := stat.uid(), stat.gid()
-	node.UID, node.GID = uid, gid
-	node.User = lookupUsername(uid)
-	node.Group = lookupGroup(gid)
+func (node Node) sameGenericAttributes(other Node) bool {
+	return deepEqual(node.GenericAttributes, other.GenericAttributes)
 }
 
-var (
-	uidLookupCache      = make(map[uint32]string)
-	uidLookupCacheMutex = sync.RWMutex{}
-)
-
-// Cached user name lookup by uid. Returns "" when no name can be found.
-func lookupUsername(uid uint32) string {
-	uidLookupCacheMutex.RLock()
-	username, ok := uidLookupCache[uid]
-	uidLookupCacheMutex.RUnlock()
-
-	if ok {
-		return username
+func deepEqual(map1, map2 map[GenericAttributeType]json.RawMessage) bool {
+	// Check if the maps have the same number of keys
+	if len(map1) != len(map2) {
+		return false
 	}
 
-	u, err := user.LookupId(strconv.Itoa(int(uid)))
-	if err == nil {
-		username = u.Username
-	}
-
-	uidLookupCacheMutex.Lock()
-	uidLookupCache[uid] = username
-	uidLookupCacheMutex.Unlock()
-
-	return username
-}
-
-var (
-	gidLookupCache      = make(map[uint32]string)
-	gidLookupCacheMutex = sync.RWMutex{}
-)
-
-// Cached group name lookup by gid. Returns "" when no name can be found.
-func lookupGroup(gid uint32) string {
-	gidLookupCacheMutex.RLock()
-	group, ok := gidLookupCache[gid]
-	gidLookupCacheMutex.RUnlock()
-
-	if ok {
-		return group
-	}
-
-	g, err := user.LookupGroupId(strconv.Itoa(int(gid)))
-	if err == nil {
-		group = g.Name
-	}
-
-	gidLookupCacheMutex.Lock()
-	gidLookupCache[gid] = group
-	gidLookupCacheMutex.Unlock()
-
-	return group
-}
-
-func (node *Node) fillExtra(path string, fi os.FileInfo) error {
-	stat, ok := toStatT(fi.Sys())
-	if !ok {
-		// fill minimal info with current values for uid, gid
-		node.UID = uint32(os.Getuid())
-		node.GID = uint32(os.Getgid())
-		node.ChangeTime = node.ModTime
-		return nil
-	}
-
-	node.Inode = uint64(stat.ino())
-	node.DeviceID = uint64(stat.dev())
-
-	node.fillTimes(stat)
-
-	node.fillUser(stat)
-
-	switch node.Type {
-	case "file":
-		node.Size = uint64(stat.size())
-		node.Links = uint64(stat.nlink())
-	case "dir":
-	case "symlink":
-		var err error
-		node.LinkTarget, err = fs.Readlink(path)
-		node.Links = uint64(stat.nlink())
-		if err != nil {
-			return errors.WithStack(err)
-		}
-	case "dev":
-		node.Device = uint64(stat.rdev())
-		node.Links = uint64(stat.nlink())
-	case "chardev":
-		node.Device = uint64(stat.rdev())
-		node.Links = uint64(stat.nlink())
-	case "fifo":
-	case "socket":
-	default:
-		return errors.Errorf("invalid node type %q", node.Type)
-	}
-
-	return node.fillExtendedAttributes(path)
-}
-
-func (node *Node) fillExtendedAttributes(path string) error {
-	xattrs, err := Listxattr(path)
-	debug.Log("fillExtendedAttributes(%v) %v %v", path, xattrs, err)
-	if err != nil {
-		return err
-	}
-
-	node.ExtendedAttributes = make([]ExtendedAttribute, 0, len(xattrs))
-	for _, attr := range xattrs {
-		attrVal, err := Getxattr(path, attr)
-		if err != nil {
-			fmt.Fprintf(os.Stderr, "can not obtain extended attribute %v for %v:\n", attr, path)
-			continue
-		}
-		attr := ExtendedAttribute{
-			Name:  attr,
-			Value: attrVal,
+	// Iterate over each key-value pair in map1
+	for key, value1 := range map1 {
+		// Check if the key exists in map2
+		value2, ok := map2[key]
+		if !ok {
+			return false
 		}
 
-		node.ExtendedAttributes = append(node.ExtendedAttributes, attr)
+		// Check if the JSON.RawMessage values are equal byte by byte
+		if !bytes.Equal(value1, value2) {
+			return false
+		}
 	}
 
+	return true
+}
+
+// HandleUnknownGenericAttributesFound is used for handling and distinguing between scenarios related to future versions and cross-OS repositories
+func HandleUnknownGenericAttributesFound(unknownAttribs []GenericAttributeType, warn func(msg string)) {
+	for _, unknownAttrib := range unknownAttribs {
+		handleUnknownGenericAttributeFound(unknownAttrib, warn)
+	}
+}
+
+// handleUnknownGenericAttributeFound is used for handling and distinguing between scenarios related to future versions and cross-OS repositories
+func handleUnknownGenericAttributeFound(genericAttributeType GenericAttributeType, warn func(msg string)) {
+	if checkGenericAttributeNameNotHandledAndPut(genericAttributeType) {
+		// Print the unique error only once for a given execution
+		os, exists := genericAttributesForOS[genericAttributeType]
+
+		if exists {
+			// If genericAttributesForOS contains an entry but we still got here, it means the specific node_xx.go for the current OS did not handle it and the repository may have been originally created on a different OS.
+			// The fact that node.go knows about the attribute, means it is not a new attribute. This may be a common situation if a repo is used across OSs.
+			debug.Log("Ignoring a generic attribute found in the repository: %s which may not be compatible with your OS. Compatible OS: %s", genericAttributeType, os)
+		} else {
+			// If genericAttributesForOS in node.go does not know about this attribute, then the repository may have been created by a newer version which has a newer GenericAttributeType.
+			warn(fmt.Sprintf("Found an unrecognized generic attribute in the repository: %s. You may need to upgrade to latest version of restic.", genericAttributeType))
+		}
+	}
+}
+
+// HandleAllUnknownGenericAttributesFound performs validations for all generic attributes of a node.
+// This is not used on windows currently because windows has handling for generic attributes.
+// nolint:unused
+func HandleAllUnknownGenericAttributesFound(attributes map[GenericAttributeType]json.RawMessage, warn func(msg string)) error {
+	for name := range attributes {
+		handleUnknownGenericAttributeFound(name, warn)
+	}
 	return nil
 }
 
-func mkfifo(path string, mode uint32) (err error) {
-	return mknod(path, mode|syscall.S_IFIFO, 0)
+var unknownGenericAttributesHandlingHistory sync.Map
+
+// checkGenericAttributeNameNotHandledAndPut checks if the GenericAttributeType name entry
+// already exists and puts it in the map if not.
+func checkGenericAttributeNameNotHandledAndPut(value GenericAttributeType) bool {
+	// If Key doesn't exist, put the value and return true because it is not already handled
+	_, exists := unknownGenericAttributesHandlingHistory.LoadOrStore(value, "")
+	// Key exists, then it is already handled so return false
+	return !exists
 }
 
-func (node *Node) fillTimes(stat *statT) {
-	ctim := stat.ctim()
-	atim := stat.atim()
-	node.ChangeTime = time.Unix(ctim.Unix())
-	node.AccessTime = time.Unix(atim.Unix())
+// The functions below are common helper functions which can be used for generic attributes support
+// across different OS.
+
+// GenericAttributesToOSAttrs gets the os specific attribute from the generic attribute using reflection
+func GenericAttributesToOSAttrs(attrs map[GenericAttributeType]json.RawMessage, attributeType reflect.Type, attributeValuePtr *reflect.Value, keyPrefix string) (unknownAttribs []GenericAttributeType, err error) {
+	attributeValue := *attributeValuePtr
+
+	for key, rawMsg := range attrs {
+		found := false
+		for i := 0; i < attributeType.NumField(); i++ {
+			if getFQKeyByIndex(attributeType, i, keyPrefix) == key {
+				found = true
+				fieldValue := attributeValue.Field(i)
+				// For directly supported types, use json.Unmarshal directly
+				if err := json.Unmarshal(rawMsg, fieldValue.Addr().Interface()); err != nil {
+					return unknownAttribs, errors.Wrap(err, "Unmarshal")
+				}
+				break
+			}
+		}
+		if !found {
+			unknownAttribs = append(unknownAttribs, key)
+		}
+	}
+	return unknownAttribs, nil
+}
+
+// getFQKey gets the fully qualified key for the field
+func getFQKey(field reflect.StructField, keyPrefix string) GenericAttributeType {
+	return GenericAttributeType(fmt.Sprintf("%s.%s", keyPrefix, field.Tag.Get("generic")))
+}
+
+// getFQKeyByIndex gets the fully qualified key for the field index
+func getFQKeyByIndex(attributeType reflect.Type, index int, keyPrefix string) GenericAttributeType {
+	return getFQKey(attributeType.Field(index), keyPrefix)
+}
+
+// OSAttrsToGenericAttributes gets the generic attribute from the os specific attribute using reflection
+func OSAttrsToGenericAttributes(attributeType reflect.Type, attributeValuePtr *reflect.Value, keyPrefix string) (attrs map[GenericAttributeType]json.RawMessage, err error) {
+	attributeValue := *attributeValuePtr
+	attrs = make(map[GenericAttributeType]json.RawMessage)
+
+	// Iterate over the fields of the struct
+	for i := 0; i < attributeType.NumField(); i++ {
+		field := attributeType.Field(i)
+
+		// Get the field value using reflection
+		fieldValue := attributeValue.FieldByName(field.Name)
+
+		// Check if the field is nil
+		if fieldValue.IsNil() {
+			// If it's nil, skip this field
+			continue
+		}
+
+		// Marshal the field value into a json.RawMessage
+		var fieldBytes []byte
+		if fieldBytes, err = json.Marshal(fieldValue.Interface()); err != nil {
+			return attrs, errors.Wrap(err, "Marshal")
+		}
+
+		// Insert the field into the map
+		attrs[getFQKey(field, keyPrefix)] = fieldBytes
+	}
+	return attrs, nil
 }

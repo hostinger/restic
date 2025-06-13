@@ -20,14 +20,16 @@ const blockSize = 512
 
 // Statically ensure that *file and *openFile implement the given interfaces
 var _ = fs.HandleReader(&openFile{})
-var _ = fs.NodeListxattrer(&file{})
+var _ = fs.NodeForgetter(&file{})
 var _ = fs.NodeGetxattrer(&file{})
+var _ = fs.NodeListxattrer(&file{})
 var _ = fs.NodeOpener(&file{})
 
 type file struct {
-	root  *Root
-	node  *restic.Node
-	inode uint64
+	root   *Root
+	forget forgetFn
+	node   *restic.Node
+	inode  uint64
 }
 
 type openFile struct {
@@ -36,12 +38,13 @@ type openFile struct {
 	cumsize []uint64
 }
 
-func newFile(root *Root, inode uint64, node *restic.Node) (fusefile *file, err error) {
+func newFile(root *Root, forget forgetFn, inode uint64, node *restic.Node) (fusefile *file, err error) {
 	debug.Log("create new file for %v with %d blobs", node.Name, len(node.Content))
 	return &file{
-		inode: inode,
-		root:  root,
-		node:  node,
+		inode:  inode,
+		forget: forget,
+		root:   root,
+		node:   node,
 	}, nil
 }
 
@@ -66,13 +69,17 @@ func (f *file) Attr(_ context.Context, a *fuse.Attr) error {
 
 }
 
-func (f *file) Open(_ context.Context, _ *fuse.OpenRequest, _ *fuse.OpenResponse) (fs.Handle, error) {
+func (f *file) Open(ctx context.Context, _ *fuse.OpenRequest, _ *fuse.OpenResponse) (fs.Handle, error) {
 	debug.Log("open file %v with %d blobs", f.node.Name, len(f.node.Content))
 
 	var bytes uint64
 	cumsize := make([]uint64, 1+len(f.node.Content))
 	for i, id := range f.node.Content {
-		size, found := f.root.repo.LookupBlobSize(id, restic.DataBlob)
+		if ctx.Err() != nil {
+			return nil, ctx.Err()
+		}
+
+		size, found := f.root.repo.LookupBlobSize(restic.DataBlob, id)
 		if !found {
 			return nil, errors.Errorf("id %v not found in repository", id)
 		}
@@ -96,19 +103,13 @@ func (f *file) Open(_ context.Context, _ *fuse.OpenRequest, _ *fuse.OpenResponse
 }
 
 func (f *openFile) getBlobAt(ctx context.Context, i int) (blob []byte, err error) {
-
-	blob, ok := f.root.blobCache.Get(f.node.Content[i])
-	if ok {
-		return blob, nil
-	}
-
-	blob, err = f.root.repo.LoadBlob(ctx, restic.DataBlob, f.node.Content[i], nil)
+	blob, err = f.root.blobCache.GetOrCompute(f.node.Content[i], func() ([]byte, error) {
+		return f.root.repo.LoadBlob(ctx, restic.DataBlob, f.node.Content[i], nil)
+	})
 	if err != nil {
 		debug.Log("LoadBlob(%v, %v) failed: %v", f.node.Name, f.node.Content[i], err)
 		return nil, unwrapCtxCanceled(err)
 	}
-
-	f.root.blobCache.Add(f.node.Content[i], blob)
 
 	return blob, nil
 }
@@ -142,8 +143,8 @@ func (f *openFile) Read(ctx context.Context, req *fuse.ReadRequest, resp *fuse.R
 	// Multiple goroutines may call service methods simultaneously;
 	// the methods being called are responsible for appropriate synchronization.
 	//
-	// However, no lock needed here as getBlobAt can be called conurrently
-	// (blobCache has it's own locking)
+	// However, no lock needed here as getBlobAt can be called concurrently
+	// (blobCache has its own locking)
 	for i := startContent; remainingBytes > 0 && i < len(f.cumsize)-1; i++ {
 		blob, err := f.getBlobAt(ctx, i)
 		if err != nil {
@@ -173,4 +174,8 @@ func (f *file) Listxattr(_ context.Context, req *fuse.ListxattrRequest, resp *fu
 
 func (f *file) Getxattr(_ context.Context, req *fuse.GetxattrRequest, resp *fuse.GetxattrResponse) error {
 	return nodeGetXattr(f.node, req, resp)
+}
+
+func (f *file) Forget() {
+	f.forget()
 }

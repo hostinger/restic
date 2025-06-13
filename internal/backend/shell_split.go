@@ -6,7 +6,7 @@ import (
 	"github.com/restic/restic/internal/errors"
 )
 
-// shellSplitter splits a command string into separater arguments. It supports
+// shellSplitter splits a command string into separated arguments. It supports
 // single and double quoted strings.
 type shellSplitter struct {
 	quote    rune
@@ -47,8 +47,8 @@ func SplitShellStrings(data string) (strs []string, err error) {
 
 	// derived from strings.SplitFunc
 	fieldStart := -1 // Set to -1 when looking for start of field.
-	for i, rune := range data {
-		if s.isSplitChar(rune) {
+	for i, r := range data {
+		if s.isSplitChar(r) {
 			if fieldStart >= 0 {
 				strs = append(strs, data[fieldStart:i])
 				fieldStart = -1

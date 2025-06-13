@@ -6,9 +6,9 @@ import (
 	"path"
 
 	"github.com/restic/restic/internal/bloblru"
-	"github.com/restic/restic/internal/errors"
 	"github.com/restic/restic/internal/restic"
 	"github.com/restic/restic/internal/walker"
+	"golang.org/x/sync/errgroup"
 )
 
 // A Dumper writes trees and files from a repository to a Writer
@@ -16,11 +16,11 @@ import (
 type Dumper struct {
 	cache  *bloblru.Cache
 	format string
-	repo   restic.Repository
+	repo   restic.Loader
 	w      io.Writer
 }
 
-func New(format string, repo restic.Repository, w io.Writer) *Dumper {
+func New(format string, repo restic.Loader, w io.Writer) *Dumper {
 	return &Dumper{
 		cache:  bloblru.New(64 << 20),
 		format: format,
@@ -47,7 +47,7 @@ func (d *Dumper) DumpTree(ctx context.Context, tree *restic.Tree, rootPath strin
 	}
 }
 
-func sendTrees(ctx context.Context, repo restic.Repository, tree *restic.Tree, rootPath string, ch chan *restic.Node) {
+func sendTrees(ctx context.Context, repo restic.BlobLoader, tree *restic.Tree, rootPath string, ch chan *restic.Node) {
 	defer close(ch)
 
 	for _, root := range tree.Nodes {
@@ -58,7 +58,7 @@ func sendTrees(ctx context.Context, repo restic.Repository, tree *restic.Tree, r
 	}
 }
 
-func sendNodes(ctx context.Context, repo restic.Repository, root *restic.Node, ch chan *restic.Node) error {
+func sendNodes(ctx context.Context, repo restic.BlobLoader, root *restic.Node, ch chan *restic.Node) error {
 	select {
 	case ch <- root:
 	case <-ctx.Done():
@@ -66,32 +66,32 @@ func sendNodes(ctx context.Context, repo restic.Repository, root *restic.Node, c
 	}
 
 	// If this is no directory we are finished
-	if !IsDir(root) {
+	if root.Type != restic.NodeTypeDir {
 		return nil
 	}
 
-	err := walker.Walk(ctx, repo, *root.Subtree, nil, func(_ restic.ID, nodepath string, node *restic.Node, err error) (bool, error) {
+	err := walker.Walk(ctx, repo, *root.Subtree, walker.WalkVisitor{ProcessNode: func(_ restic.ID, nodepath string, node *restic.Node, err error) error {
 		if err != nil {
-			return false, err
+			return err
 		}
 		if node == nil {
-			return false, nil
+			return nil
 		}
 
 		node.Path = path.Join(root.Path, nodepath)
 
-		if !IsFile(node) && !IsDir(node) && !IsLink(node) {
-			return false, nil
+		if node.Type != restic.NodeTypeFile && node.Type != restic.NodeTypeDir && node.Type != restic.NodeTypeSymlink {
+			return nil
 		}
 
 		select {
 		case ch <- node:
 		case <-ctx.Done():
-			return false, ctx.Err()
+			return ctx.Err()
 		}
 
-		return false, nil
-	})
+		return nil
+	}})
 
 	return err
 }
@@ -103,40 +103,50 @@ func (d *Dumper) WriteNode(ctx context.Context, node *restic.Node) error {
 }
 
 func (d *Dumper) writeNode(ctx context.Context, w io.Writer, node *restic.Node) error {
-	var (
-		buf []byte
-		err error
-	)
-	for _, id := range node.Content {
-		blob, ok := d.cache.Get(id)
-		if !ok {
-			blob, err = d.repo.LoadBlob(ctx, restic.DataBlob, id, buf)
-			if err != nil {
-				return err
+	wg, ctx := errgroup.WithContext(ctx)
+	limit := d.repo.Connections() - 1 // See below for the -1.
+	blobs := make(chan (<-chan []byte), limit)
+
+	wg.Go(func() error {
+		for ch := range blobs {
+			select {
+			case <-ctx.Done():
+				return ctx.Err()
+			case blob := <-ch:
+				if _, err := w.Write(blob); err != nil {
+					return err
+				}
 			}
-
-			buf = d.cache.Add(id, blob) // Reuse evicted buffer.
 		}
+		return nil
+	})
 
-		if _, err := w.Write(blob); err != nil {
-			return errors.Wrap(err, "Write")
+	// Start short-lived goroutines to load blobs.
+	// There will be at most 1+cap(blobs) calling LoadBlob at any moment.
+loop:
+	for _, id := range node.Content {
+		// This needs to be buffered, so that loaders can quit
+		// without waiting for the writer.
+		ch := make(chan []byte, 1)
+
+		wg.Go(func() error {
+			blob, err := d.cache.GetOrCompute(id, func() ([]byte, error) {
+				return d.repo.LoadBlob(ctx, restic.DataBlob, id, nil)
+			})
+
+			if err == nil {
+				ch <- blob
+			}
+			return err
+		})
+
+		select {
+		case blobs <- ch:
+		case <-ctx.Done():
+			break loop
 		}
 	}
 
-	return nil
-}
-
-// IsDir checks if the given node is a directory.
-func IsDir(node *restic.Node) bool {
-	return node.Type == "dir"
-}
-
-// IsLink checks if the given node as a link.
-func IsLink(node *restic.Node) bool {
-	return node.Type == "symlink"
-}
-
-// IsFile checks if the given node is a file.
-func IsFile(node *restic.Node) bool {
-	return node.Type == "file"
+	close(blobs)
+	return wg.Wait()
 }

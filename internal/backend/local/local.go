@@ -2,6 +2,7 @@ package local
 
 import (
 	"context"
+	"fmt"
 	"hash"
 	"io"
 	"os"
@@ -12,10 +13,10 @@ import (
 	"github.com/restic/restic/internal/backend/layout"
 	"github.com/restic/restic/internal/backend/limiter"
 	"github.com/restic/restic/internal/backend/location"
+	"github.com/restic/restic/internal/backend/util"
 	"github.com/restic/restic/internal/debug"
 	"github.com/restic/restic/internal/errors"
 	"github.com/restic/restic/internal/fs"
-	"github.com/restic/restic/internal/restic"
 
 	"github.com/cenkalti/backoff/v4"
 )
@@ -24,26 +25,23 @@ import (
 type Local struct {
 	Config
 	layout.Layout
-	backend.Modes
+	util.Modes
 }
 
-// ensure statically that *Local implements restic.Backend.
-var _ restic.Backend = &Local{}
+// ensure statically that *Local implements backend.Backend.
+var _ backend.Backend = &Local{}
+
+var errTooShort = fmt.Errorf("file is too short")
 
 func NewFactory() location.Factory {
 	return location.NewLimitedBackendFactory("local", ParseConfig, location.NoPassword, limiter.WrapBackendConstructor(Create), limiter.WrapBackendConstructor(Open))
 }
 
-const defaultLayout = "default"
+func open(cfg Config) (*Local, error) {
+	l := layout.NewDefaultLayout(cfg.Path, filepath.Join)
 
-func open(ctx context.Context, cfg Config) (*Local, error) {
-	l, err := layout.ParseLayout(ctx, &layout.LocalFilesystem{}, cfg.Layout, defaultLayout, cfg.Path)
-	if err != nil {
-		return nil, err
-	}
-
-	fi, err := fs.Stat(l.Filename(restic.Handle{Type: restic.ConfigFile}))
-	m := backend.DeriveModesFromFileInfo(fi, err)
+	fi, err := os.Stat(l.Filename(backend.Handle{Type: backend.ConfigFile}))
+	m := util.DeriveModesFromFileInfo(fi, err)
 	debug.Log("using (%03O file, %03O dir) permissions", m.File, m.Dir)
 
 	return &Local{
@@ -54,30 +52,30 @@ func open(ctx context.Context, cfg Config) (*Local, error) {
 }
 
 // Open opens the local backend as specified by config.
-func Open(ctx context.Context, cfg Config) (*Local, error) {
-	debug.Log("open local backend at %v (layout %q)", cfg.Path, cfg.Layout)
-	return open(ctx, cfg)
+func Open(_ context.Context, cfg Config) (*Local, error) {
+	debug.Log("open local backend at %v", cfg.Path)
+	return open(cfg)
 }
 
 // Create creates all the necessary files and directories for a new local
 // backend at dir. Afterwards a new config blob should be created.
-func Create(ctx context.Context, cfg Config) (*Local, error) {
-	debug.Log("create local backend at %v (layout %q)", cfg.Path, cfg.Layout)
+func Create(_ context.Context, cfg Config) (*Local, error) {
+	debug.Log("create local backend at %v", cfg.Path)
 
-	be, err := open(ctx, cfg)
+	be, err := open(cfg)
 	if err != nil {
 		return nil, err
 	}
 
 	// test if config file already exists
-	_, err = fs.Lstat(be.Filename(restic.Handle{Type: restic.ConfigFile}))
+	_, err = os.Lstat(be.Filename(backend.Handle{Type: backend.ConfigFile}))
 	if err == nil {
 		return nil, errors.New("config file already exists")
 	}
 
 	// create paths for data and refs
 	for _, d := range be.Paths() {
-		err := fs.MkdirAll(d, be.Modes.Dir)
+		err := os.MkdirAll(d, be.Modes.Dir)
 		if err != nil {
 			return nil, errors.WithStack(err)
 		}
@@ -86,13 +84,11 @@ func Create(ctx context.Context, cfg Config) (*Local, error) {
 	return be, nil
 }
 
-func (b *Local) Connections() uint {
-	return b.Config.Connections
-}
-
-// Location returns this backend's location (the directory name).
-func (b *Local) Location() string {
-	return b.Path
+func (b *Local) Properties() backend.Properties {
+	return backend.Properties{
+		Connections:      b.Config.Connections,
+		HasAtomicReplace: true,
+	}
 }
 
 // Hasher may return a hash function for calculating a content hash for the backend
@@ -100,18 +96,17 @@ func (b *Local) Hasher() hash.Hash {
 	return nil
 }
 
-// HasAtomicReplace returns whether Save() can atomically replace files
-func (b *Local) HasAtomicReplace() bool {
-	return true
-}
-
 // IsNotExist returns true if the error is caused by a non existing file.
 func (b *Local) IsNotExist(err error) bool {
 	return errors.Is(err, os.ErrNotExist)
 }
 
+func (b *Local) IsPermanentError(err error) bool {
+	return b.IsNotExist(err) || errors.Is(err, errTooShort) || errors.Is(err, os.ErrPermission)
+}
+
 // Save stores data in the backend at the handle.
-func (b *Local) Save(_ context.Context, h restic.Handle, rd restic.RewindReader) (err error) {
+func (b *Local) Save(_ context.Context, h backend.Handle, rd backend.RewindReader) (err error) {
 	finalname := b.Filename(h)
 	dir := filepath.Dir(finalname)
 
@@ -130,7 +125,7 @@ func (b *Local) Save(_ context.Context, h restic.Handle, rd restic.RewindReader)
 		debug.Log("error %v: creating dir", err)
 
 		// error is caused by a missing directory, try to create it
-		mkdirErr := fs.MkdirAll(dir, b.Modes.Dir)
+		mkdirErr := os.MkdirAll(dir, b.Modes.Dir)
 		if mkdirErr != nil {
 			debug.Log("error creating dir %v: %v", dir, mkdirErr)
 		} else {
@@ -150,7 +145,7 @@ func (b *Local) Save(_ context.Context, h restic.Handle, rd restic.RewindReader)
 			// temporary's name and no other goroutine will get the same data to
 			// Save, so the temporary name should never be reused by another
 			// goroutine.
-			_ = fs.Remove(f.Name())
+			_ = os.Remove(f.Name())
 		}
 	}(f)
 
@@ -194,7 +189,7 @@ func (b *Local) Save(_ context.Context, h restic.Handle, rd restic.RewindReader)
 		}
 	}
 
-	// try to mark file as read-only to avoid accidential modifications
+	// try to mark file as read-only to avoid accidental modifications
 	// ignore if the operation fails as some filesystems don't allow the chmod call
 	// e.g. exfat and network file systems with certain mount options
 	err = setFileReadonly(finalname, b.Modes.File)
@@ -209,14 +204,26 @@ var tempFile = os.CreateTemp // Overridden by test.
 
 // Load runs fn with a reader that yields the contents of the file at h at the
 // given offset.
-func (b *Local) Load(ctx context.Context, h restic.Handle, length int, offset int64, fn func(rd io.Reader) error) error {
-	return backend.DefaultLoad(ctx, h, length, offset, b.openReader, fn)
+func (b *Local) Load(ctx context.Context, h backend.Handle, length int, offset int64, fn func(rd io.Reader) error) error {
+	return util.DefaultLoad(ctx, h, length, offset, b.openReader, fn)
 }
 
-func (b *Local) openReader(_ context.Context, h restic.Handle, length int, offset int64) (io.ReadCloser, error) {
-	f, err := fs.Open(b.Filename(h))
+func (b *Local) openReader(_ context.Context, h backend.Handle, length int, offset int64) (io.ReadCloser, error) {
+	f, err := os.Open(b.Filename(h))
 	if err != nil {
 		return nil, err
+	}
+
+	fi, err := f.Stat()
+	if err != nil {
+		_ = f.Close()
+		return nil, err
+	}
+
+	size := fi.Size()
+	if size < offset+int64(length) {
+		_ = f.Close()
+		return nil, errTooShort
 	}
 
 	if offset > 0 {
@@ -228,38 +235,38 @@ func (b *Local) openReader(_ context.Context, h restic.Handle, length int, offse
 	}
 
 	if length > 0 {
-		return backend.LimitReadCloser(f, int64(length)), nil
+		return util.LimitReadCloser(f, int64(length)), nil
 	}
 
 	return f, nil
 }
 
 // Stat returns information about a blob.
-func (b *Local) Stat(_ context.Context, h restic.Handle) (restic.FileInfo, error) {
-	fi, err := fs.Stat(b.Filename(h))
+func (b *Local) Stat(_ context.Context, h backend.Handle) (backend.FileInfo, error) {
+	fi, err := os.Stat(b.Filename(h))
 	if err != nil {
-		return restic.FileInfo{}, errors.WithStack(err)
+		return backend.FileInfo{}, errors.WithStack(err)
 	}
 
-	return restic.FileInfo{Size: fi.Size(), Name: h.Name}, nil
+	return backend.FileInfo{Size: fi.Size(), Name: h.Name}, nil
 }
 
 // Remove removes the blob with the given name and type.
-func (b *Local) Remove(_ context.Context, h restic.Handle) error {
+func (b *Local) Remove(_ context.Context, h backend.Handle) error {
 	fn := b.Filename(h)
 
 	// reset read-only flag
-	err := fs.Chmod(fn, 0666)
+	err := os.Chmod(fn, 0666)
 	if err != nil && !os.IsPermission(err) {
 		return errors.WithStack(err)
 	}
 
-	return fs.Remove(fn)
+	return os.Remove(fn)
 }
 
 // List runs fn for each file in the backend which has the type t. When an
 // error occurs (or fn returns an error), List stops and returns it.
-func (b *Local) List(ctx context.Context, t restic.FileType, fn func(restic.FileInfo) error) (err error) {
+func (b *Local) List(ctx context.Context, t backend.FileType, fn func(backend.FileInfo) error) (err error) {
 	basedir, subdirs := b.Basedir(t)
 	if subdirs {
 		err = visitDirs(ctx, basedir, fn)
@@ -279,8 +286,8 @@ func (b *Local) List(ctx context.Context, t restic.FileType, fn func(restic.File
 // two levels of directory structure (including dir itself as the first level).
 // Also, visitDirs assumes it sees a directory full of directories, while
 // visitFiles wants a directory full or regular files.
-func visitDirs(ctx context.Context, dir string, fn func(restic.FileInfo) error) error {
-	d, err := fs.Open(dir)
+func visitDirs(ctx context.Context, dir string, fn func(backend.FileInfo) error) error {
+	d, err := os.Open(dir)
 	if err != nil {
 		return err
 	}
@@ -306,8 +313,8 @@ func visitDirs(ctx context.Context, dir string, fn func(restic.FileInfo) error) 
 	return ctx.Err()
 }
 
-func visitFiles(ctx context.Context, dir string, fn func(restic.FileInfo) error, ignoreNotADirectory bool) error {
-	d, err := fs.Open(dir)
+func visitFiles(ctx context.Context, dir string, fn func(backend.FileInfo) error, ignoreNotADirectory bool) error {
+	d, err := os.Open(dir)
 	if err != nil {
 		return err
 	}
@@ -340,7 +347,7 @@ func visitFiles(ctx context.Context, dir string, fn func(restic.FileInfo) error,
 		default:
 		}
 
-		err := fn(restic.FileInfo{
+		err := fn(backend.FileInfo{
 			Name: fi.Name(),
 			Size: fi.Size(),
 		})
@@ -353,7 +360,7 @@ func visitFiles(ctx context.Context, dir string, fn func(restic.FileInfo) error,
 
 // Delete removes the repository and all files.
 func (b *Local) Delete(_ context.Context) error {
-	return fs.RemoveAll(b.Path)
+	return os.RemoveAll(b.Path)
 }
 
 // Close closes all open files.
@@ -362,3 +369,9 @@ func (b *Local) Close() error {
 	// same function.
 	return nil
 }
+
+// Warmup not implemented
+func (b *Local) Warmup(_ context.Context, _ []backend.Handle) ([]backend.Handle, error) {
+	return []backend.Handle{}, nil
+}
+func (b *Local) WarmupWait(_ context.Context, _ []backend.Handle) error { return nil }

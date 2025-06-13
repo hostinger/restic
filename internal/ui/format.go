@@ -8,6 +8,8 @@ import (
 	"math/bits"
 	"strconv"
 	"time"
+
+	"golang.org/x/text/width"
 )
 
 func FormatBytes(c uint64) string {
@@ -51,12 +53,12 @@ func FormatDuration(d time.Duration) string {
 func FormatSeconds(sec uint64) string {
 	hours := sec / 3600
 	sec -= hours * 3600
-	min := sec / 60
-	sec -= min * 60
+	mins := sec / 60
+	sec -= mins * 60
 	if hours > 0 {
-		return fmt.Sprintf("%d:%02d:%02d", hours, min, sec)
+		return fmt.Sprintf("%d:%02d:%02d", hours, mins, sec)
 	}
-	return fmt.Sprintf("%d:%02d", min, sec)
+	return fmt.Sprintf("%d:%02d", mins, sec)
 }
 
 // ParseBytes parses a size in bytes from s. It understands the suffixes
@@ -104,4 +106,25 @@ func ToJSONString(status interface{}) string {
 		panic(err)
 	}
 	return buf.String()
+}
+
+// TerminalDisplayWidth returns the number of terminal cells needed to display s
+func TerminalDisplayWidth(s string) int {
+	width := 0
+	for _, r := range s {
+		width += terminalDisplayRuneWidth(r)
+	}
+
+	return width
+}
+
+func terminalDisplayRuneWidth(r rune) int {
+	switch width.LookupRune(r).Kind() {
+	case width.EastAsianWide, width.EastAsianFullwidth:
+		return 2
+	case width.EastAsianNarrow, width.EastAsianHalfwidth, width.EastAsianAmbiguous, width.Neutral:
+		return 1
+	default:
+		return 0
+	}
 }

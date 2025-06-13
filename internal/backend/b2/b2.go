@@ -2,6 +2,7 @@ package b2
 
 import (
 	"context"
+	"fmt"
 	"hash"
 	"io"
 	"net/http"
@@ -12,12 +13,12 @@ import (
 	"github.com/restic/restic/internal/backend"
 	"github.com/restic/restic/internal/backend/layout"
 	"github.com/restic/restic/internal/backend/location"
+	"github.com/restic/restic/internal/backend/util"
 	"github.com/restic/restic/internal/debug"
 	"github.com/restic/restic/internal/errors"
-	"github.com/restic/restic/internal/restic"
 
-	"github.com/kurin/blazer/b2"
-	"github.com/kurin/blazer/base"
+	"github.com/Backblaze/blazer/b2"
+	"github.com/Backblaze/blazer/base"
 )
 
 // b2Backend is a backend which stores its data on Backblaze B2.
@@ -31,11 +32,13 @@ type b2Backend struct {
 	canDelete bool
 }
 
-// Billing happens in 1000 item granlarity, but we are more interested in reducing the number of network round trips
+var errTooShort = fmt.Errorf("file is too short")
+
+// Billing happens in 1000 item granularity, but we are more interested in reducing the number of network round trips
 const defaultListMaxItems = 10 * 1000
 
-// ensure statically that *b2Backend implements restic.Backend.
-var _ restic.Backend = &b2Backend{}
+// ensure statically that *b2Backend implements backend.Backend.
+var _ backend.Backend = &b2Backend{}
 
 func NewFactory() location.Factory {
 	return location.NewHTTPBackendFactory("b2", ParseConfig, location.NoPassword, Create, Open)
@@ -85,7 +88,7 @@ func newClient(ctx context.Context, cfg Config, rt http.RoundTripper) (*b2.Clien
 }
 
 // Open opens a connection to the B2 service.
-func Open(ctx context.Context, cfg Config, rt http.RoundTripper) (restic.Backend, error) {
+func Open(ctx context.Context, cfg Config, rt http.RoundTripper) (backend.Backend, error) {
 	debug.Log("cfg %#v", cfg)
 
 	ctx, cancel := context.WithCancel(ctx)
@@ -97,18 +100,17 @@ func Open(ctx context.Context, cfg Config, rt http.RoundTripper) (restic.Backend
 	}
 
 	bucket, err := client.Bucket(ctx, cfg.Bucket)
-	if err != nil {
+	if b2.IsNotExist(err) {
+		return nil, backend.ErrNoRepository
+	} else if err != nil {
 		return nil, errors.Wrap(err, "Bucket")
 	}
 
 	be := &b2Backend{
-		client: client,
-		bucket: bucket,
-		cfg:    cfg,
-		Layout: &layout.DefaultLayout{
-			Join: path.Join,
-			Path: cfg.Prefix,
-		},
+		client:       client,
+		bucket:       bucket,
+		cfg:          cfg,
+		Layout:       layout.NewDefaultLayout(cfg.Prefix, path.Join),
 		listMaxItems: defaultListMaxItems,
 		canDelete:    true,
 	}
@@ -118,7 +120,7 @@ func Open(ctx context.Context, cfg Config, rt http.RoundTripper) (restic.Backend
 
 // Create opens a connection to the B2 service. If the bucket does not exist yet,
 // it is created.
-func Create(ctx context.Context, cfg Config, rt http.RoundTripper) (restic.Backend, error) {
+func Create(ctx context.Context, cfg Config, rt http.RoundTripper) (backend.Backend, error) {
 	debug.Log("cfg %#v", cfg)
 
 	ctx, cancel := context.WithCancel(ctx)
@@ -138,13 +140,10 @@ func Create(ctx context.Context, cfg Config, rt http.RoundTripper) (restic.Backe
 	}
 
 	be := &b2Backend{
-		client: client,
-		bucket: bucket,
-		cfg:    cfg,
-		Layout: &layout.DefaultLayout{
-			Join: path.Join,
-			Path: cfg.Prefix,
-		},
+		client:       client,
+		bucket:       bucket,
+		cfg:          cfg,
+		Layout:       layout.NewDefaultLayout(cfg.Prefix, path.Join),
 		listMaxItems: defaultListMaxItems,
 	}
 	return be, nil
@@ -155,23 +154,16 @@ func (be *b2Backend) SetListMaxItems(i int) {
 	be.listMaxItems = i
 }
 
-func (be *b2Backend) Connections() uint {
-	return be.cfg.Connections
-}
-
-// Location returns the location for the backend.
-func (be *b2Backend) Location() string {
-	return be.cfg.Bucket
+func (be *b2Backend) Properties() backend.Properties {
+	return backend.Properties{
+		Connections:      be.cfg.Connections,
+		HasAtomicReplace: true,
+	}
 }
 
 // Hasher may return a hash function for calculating a content hash for the backend
 func (be *b2Backend) Hasher() hash.Hash {
 	return nil
-}
-
-// HasAtomicReplace returns whether Save() can atomically replace files
-func (be *b2Backend) HasAtomicReplace() bool {
-	return true
 }
 
 // IsNotExist returns true if the error is caused by a non-existing file.
@@ -186,16 +178,39 @@ func (be *b2Backend) IsNotExist(err error) bool {
 	return false
 }
 
+func (be *b2Backend) IsPermanentError(err error) bool {
+	// the library unfortunately endlessly retries authentication errors
+	return be.IsNotExist(err) || errors.Is(err, errTooShort)
+}
+
 // Load runs fn with a reader that yields the contents of the file at h at the
 // given offset.
-func (be *b2Backend) Load(ctx context.Context, h restic.Handle, length int, offset int64, fn func(rd io.Reader) error) error {
+func (be *b2Backend) Load(ctx context.Context, h backend.Handle, length int, offset int64, fn func(rd io.Reader) error) error {
 	ctx, cancel := context.WithCancel(ctx)
 	defer cancel()
 
-	return backend.DefaultLoad(ctx, h, length, offset, be.openReader, fn)
+	return util.DefaultLoad(ctx, h, length, offset, be.openReader, func(rd io.Reader) error {
+		if length == 0 {
+			return fn(rd)
+		}
+
+		// there is no direct way to efficiently check whether the file is too short
+		// use a LimitedReader to track the number of bytes read
+		limrd := &io.LimitedReader{R: rd, N: int64(length)}
+		err := fn(limrd)
+
+		// check the underlying reader to be agnostic to however fn() handles the returned error
+		_, rderr := rd.Read([]byte{0})
+		if rderr == io.EOF && limrd.N != 0 {
+			// file is too short
+			return fmt.Errorf("%w: %v", errTooShort, err)
+		}
+
+		return err
+	})
 }
 
-func (be *b2Backend) openReader(ctx context.Context, h restic.Handle, length int, offset int64) (io.ReadCloser, error) {
+func (be *b2Backend) openReader(ctx context.Context, h backend.Handle, length int, offset int64) (io.ReadCloser, error) {
 	name := be.Layout.Filename(h)
 	obj := be.bucket.Object(name)
 
@@ -213,7 +228,7 @@ func (be *b2Backend) openReader(ctx context.Context, h restic.Handle, length int
 }
 
 // Save stores data in the backend at the handle.
-func (be *b2Backend) Save(ctx context.Context, h restic.Handle, rd restic.RewindReader) error {
+func (be *b2Backend) Save(ctx context.Context, h backend.Handle, rd backend.RewindReader) error {
 	ctx, cancel := context.WithCancel(ctx)
 	defer cancel()
 
@@ -237,18 +252,18 @@ func (be *b2Backend) Save(ctx context.Context, h restic.Handle, rd restic.Rewind
 }
 
 // Stat returns information about a blob.
-func (be *b2Backend) Stat(ctx context.Context, h restic.Handle) (bi restic.FileInfo, err error) {
+func (be *b2Backend) Stat(ctx context.Context, h backend.Handle) (bi backend.FileInfo, err error) {
 	name := be.Filename(h)
 	obj := be.bucket.Object(name)
 	info, err := obj.Attrs(ctx)
 	if err != nil {
-		return restic.FileInfo{}, errors.Wrap(err, "Stat")
+		return backend.FileInfo{}, errors.Wrap(err, "Stat")
 	}
-	return restic.FileInfo{Size: info.Size, Name: h.Name}, nil
+	return backend.FileInfo{Size: info.Size, Name: h.Name}, nil
 }
 
 // Remove removes the blob with the given name and type.
-func (be *b2Backend) Remove(ctx context.Context, h restic.Handle) error {
+func (be *b2Backend) Remove(ctx context.Context, h backend.Handle) error {
 	// the retry backend will also repeat the remove method up to 10 times
 	for i := 0; i < 3; i++ {
 		obj := be.bucket.Object(be.Filename(h))
@@ -284,7 +299,7 @@ func (be *b2Backend) Remove(ctx context.Context, h restic.Handle) error {
 }
 
 // List returns a channel that yields all names of blobs of type t.
-func (be *b2Backend) List(ctx context.Context, t restic.FileType, fn func(restic.FileInfo) error) error {
+func (be *b2Backend) List(ctx context.Context, t backend.FileType, fn func(backend.FileInfo) error) error {
 	ctx, cancel := context.WithCancel(ctx)
 	defer cancel()
 
@@ -299,7 +314,7 @@ func (be *b2Backend) List(ctx context.Context, t restic.FileType, fn func(restic
 			return err
 		}
 
-		fi := restic.FileInfo{
+		fi := backend.FileInfo{
 			Name: path.Base(obj.Name()),
 			Size: attrs.Size,
 		}
@@ -313,8 +328,14 @@ func (be *b2Backend) List(ctx context.Context, t restic.FileType, fn func(restic
 
 // Delete removes all restic keys in the bucket. It will not remove the bucket itself.
 func (be *b2Backend) Delete(ctx context.Context) error {
-	return backend.DefaultDelete(ctx, be)
+	return util.DefaultDelete(ctx, be)
 }
 
 // Close does nothing
 func (be *b2Backend) Close() error { return nil }
+
+// Warmup not implemented
+func (be *b2Backend) Warmup(_ context.Context, _ []backend.Handle) ([]backend.Handle, error) {
+	return []backend.Handle{}, nil
+}
+func (be *b2Backend) WarmupWait(_ context.Context, _ []backend.Handle) error { return nil }
