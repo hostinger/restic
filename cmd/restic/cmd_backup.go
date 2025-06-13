@@ -18,6 +18,7 @@ import (
 	"github.com/spf13/pflag"
 	"golang.org/x/sync/errgroup"
 
+	"github.com/restic/restic/hostinger"
 	"github.com/restic/restic/internal/archiver"
 	"github.com/restic/restic/internal/debug"
 	"github.com/restic/restic/internal/errors"
@@ -103,6 +104,7 @@ type BackupOptions struct {
 	ReadConcurrency   uint
 	NoScan            bool
 	SkipIfUnchanged   bool
+	ScopeSymlinks     string
 }
 
 func (opts *BackupOptions) AddFlags(f *pflag.FlagSet) {
@@ -143,6 +145,7 @@ func (opts *BackupOptions) AddFlags(f *pflag.FlagSet) {
 		f.BoolVar(&opts.ExcludeCloudFiles, "exclude-cloud-files", false, "excludes online-only cloud files (such as OneDrive Files On-Demand)")
 	}
 	f.BoolVar(&opts.SkipIfUnchanged, "skip-if-unchanged", false, "skip snapshot creation if identical to parent snapshot")
+	f.StringVar(&opts.ScopeSymlinks, "scope-symlinks", "", "exclude symlinks that are targeting files outside this path")
 
 	// parse read concurrency from env, on error the default value will be used
 	readConcurrency, _ := strconv.ParseUint(os.Getenv("RESTIC_READ_CONCURRENCY"), 10, 32)
@@ -370,6 +373,15 @@ func collectRejectFuncs(opts BackupOptions, targets []string, fs fs.FS) (funcs [
 
 	for _, spec := range opts.ExcludeIfPresent {
 		f, err := archiver.RejectIfPresent(spec, Warnf)
+		if err != nil {
+			return nil, err
+		}
+
+		funcs = append(funcs, f)
+	}
+
+	if opts.ScopeSymlinks != "" {
+		f, err := hostinger.RejectSymlinksOutsideScope(opts.ScopeSymlinks)
 		if err != nil {
 			return nil, err
 		}

@@ -5,6 +5,7 @@ import (
 	"path/filepath"
 	"time"
 
+	"github.com/restic/restic/hostinger"
 	"github.com/restic/restic/internal/debug"
 	"github.com/restic/restic/internal/errors"
 	"github.com/restic/restic/internal/filter"
@@ -69,6 +70,7 @@ type RestoreOptions struct {
 	Delete              bool
 	ExcludeXattrPattern []string
 	IncludeXattrPattern []string
+	ScopeSymlinks       string
 }
 
 func (opts *RestoreOptions) AddFlags(f *pflag.FlagSet) {
@@ -86,6 +88,7 @@ func (opts *RestoreOptions) AddFlags(f *pflag.FlagSet) {
 	f.BoolVar(&opts.Verify, "verify", false, "verify restored files content")
 	f.Var(&opts.Overwrite, "overwrite", "overwrite behavior, one of (always|if-changed|if-newer|never)")
 	f.BoolVar(&opts.Delete, "delete", false, "delete files from target directory if they do not exist in snapshot. Use '--dry-run -vv' to check what would be deleted")
+	f.StringVar(&opts.ScopeSymlinks, "scope-symlinks", "", "do not extract symlinks that are targeting files outside this path")
 }
 
 func runRestore(ctx context.Context, opts RestoreOptions, gopts GlobalOptions,
@@ -228,72 +231,14 @@ func runRestore(ctx context.Context, opts RestoreOptions, gopts GlobalOptions,
 		return selectedForRestore, childMayBeSelected
 	}
 
-	symlinkScope := opts.ScopeSymlinks
-	selectSymlinkScopeFilter := func(item string, dstpath string, node *restic.Node) (selectedForRestore bool, childMayBeSelected bool) {
-		childMayBeSelected = node.Type == "dir"
-
-		dstdir := filepath.Dir(dstpath)
-		// if dstdir already exists eval any symlinks it may contain
-		// and check if the path diverges from the scope
-		if _, err := os.Stat(dstdir); err == nil || !os.IsNotExist(err) {
-			evaldstdir, err := filepath.EvalSymlinks(dstdir)
-			if err != nil {
-				msg.E("error for destination eval symlink: %v", err)
-				return false, childMayBeSelected
-			}
-
-			if evaldstdir != dstdir {
-				if !strings.HasPrefix(evaldstdir, symlinkScope) && !strings.HasPrefix(symlinkScope, evaldstdir) {
-					debug.Log("destination dir %s is a outside scope %s", evaldstdir, symlinkScope)
-					return false, childMayBeSelected
-				}
-			}
-
-			dstdir = evaldstdir
-		}
-
-		// node.LinkTarget can be absolute (e.g. /var/test/target) or:
-		// 1. relative, with .. somewhere in the path (e.g. /var/test/target/next/..)
-		// 2. relative, starting with . (e.g. ./test/target)
-		//
-		// Need to clean node.LinkTarget to remove abundant relative path links:
-		//   /var/test/target/next/.. -> /var/test/target
-		//   ./test/target -> test/target
-		//
-		// The path can still be relative after Clean (e.g. ./var/../../target -> ../target)
-		// so we need to convert it to absolute with destination path in mind.
-		// To do this, select the top destination path element that is not a file
-		// and append the target to it:
-		//   /restore/test/symlink -> /restore/test/../target
-		//
-		// and then run Clean again to remove remaining relative path links:
-		//   /restore/test/../target -> /restore/target
-		if node.Type == "symlink" {
-			target := filepath.Clean(node.LinkTarget)
-			if !filepath.IsAbs(target) {
-				target = filepath.Clean(filepath.Join(dstdir, target))
-			}
-
-			if !strings.HasPrefix(target, symlinkScope) {
-				debug.Log("item %s is a symlink to %s which is outside of scope %s", item, target, symlinkScope)
-				return false, childMayBeSelected
-			}
-		} else {
-			target := filepath.Join(dstdir, filepath.Base(dstpath))
-			if !strings.HasPrefix(target, symlinkScope) && !strings.HasPrefix(symlinkScope, target) {
-				debug.Log("item %s leads to %s which is outside of scope %s", item, target, symlinkScope)
-				return false, childMayBeSelected
-			}
-		}
-
-		return true, childMayBeSelected
-	}
-
-	selectFilters := []func(item string, dstpath string, node *restic.Node) (selectedForRestore bool, childMayBeSelected bool){}
 	if hasExcludes {
-		selectFilters = append(selectFilters, selectExcludeFilter)
+		res.SelectFilter = selectExcludeFilter
 	} else if hasIncludes {
 		res.SelectFilter = selectIncludeFilter
+	}
+
+	if opts.ScopeSymlinks != "" {
+		res.NodeFilter = hostinger.SymlinkScopeNodeFilter(opts.ScopeSymlinks)
 	}
 
 	res.XattrSelectFilter, err = getXattrSelectFilter(opts)
