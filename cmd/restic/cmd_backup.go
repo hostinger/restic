@@ -12,15 +12,16 @@ import (
 	"runtime"
 	"strconv"
 	"strings"
-	"sync"
 	"time"
 
 	"github.com/spf13/cobra"
+	"github.com/spf13/pflag"
 	"golang.org/x/sync/errgroup"
 
 	"github.com/restic/restic/internal/archiver"
 	"github.com/restic/restic/internal/debug"
 	"github.com/restic/restic/internal/errors"
+	"github.com/restic/restic/internal/filter"
 	"github.com/restic/restic/internal/fs"
 	"github.com/restic/restic/internal/repository"
 	"github.com/restic/restic/internal/restic"
@@ -30,10 +31,13 @@ import (
 	"github.com/restic/restic/internal/ui/termstatus"
 )
 
-var cmdBackup = &cobra.Command{
-	Use:   "backup [flags] [FILE/DIR] ...",
-	Short: "Create a new backup of files and/or directories",
-	Long: `
+func newBackupCommand() *cobra.Command {
+	var opts BackupOptions
+
+	cmd := &cobra.Command{
+		Use:   "backup [flags] [FILE/DIR] ...",
+		Short: "Create a new backup of files and/or directories",
+		Long: `
 The "backup" command creates a new snapshot and saves the files and directories
 given as the arguments.
 
@@ -43,50 +47,36 @@ EXIT STATUS
 Exit status is 0 if the command was successful.
 Exit status is 1 if there was a fatal error (no snapshot created).
 Exit status is 3 if some source data could not be read (incomplete snapshot created).
+Exit status is 10 if the repository does not exist.
+Exit status is 11 if the repository is already locked.
+Exit status is 12 if the password is incorrect.
 `,
-	PreRun: func(cmd *cobra.Command, args []string) {
-		if backupOptions.Host == "" {
-			hostname, err := os.Hostname()
-			if err != nil {
-				debug.Log("os.Hostname() returned err: %v", err)
-				return
+		PreRun: func(_ *cobra.Command, _ []string) {
+			if opts.Host == "" {
+				hostname, err := os.Hostname()
+				if err != nil {
+					debug.Log("os.Hostname() returned err: %v", err)
+					return
+				}
+				opts.Host = hostname
 			}
-			backupOptions.Host = hostname
-		}
-	},
-	DisableAutoGenTag: true,
-	RunE: func(cmd *cobra.Command, args []string) error {
-		ctx := cmd.Context()
-		var wg sync.WaitGroup
-		cancelCtx, cancel := context.WithCancel(ctx)
-		defer func() {
-			// shutdown termstatus
-			cancel()
-			wg.Wait()
-		}()
+		},
+		GroupID:           cmdGroupDefault,
+		DisableAutoGenTag: true,
+		RunE: func(cmd *cobra.Command, args []string) error {
+			term, cancel := setupTermstatus()
+			defer cancel()
+			return runBackup(cmd.Context(), opts, globalOptions, term, args)
+		},
+	}
 
-		term := termstatus.New(globalOptions.stdout, globalOptions.stderr, globalOptions.Quiet)
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
-			term.Run(cancelCtx)
-		}()
-
-		// use the terminal for stdout/stderr
-		prevStdout, prevStderr := globalOptions.stdout, globalOptions.stderr
-		defer func() {
-			globalOptions.stdout, globalOptions.stderr = prevStdout, prevStderr
-		}()
-		stdioWrapper := ui.NewStdioWrapper(term)
-		globalOptions.stdout, globalOptions.stderr = stdioWrapper.Stdout(), stdioWrapper.Stderr()
-
-		return runBackup(ctx, backupOptions, globalOptions, term, args)
-	},
+	opts.AddFlags(cmd.Flags())
+	return cmd
 }
 
 // BackupOptions bundles all options for the backup command.
 type BackupOptions struct {
-	excludePatternOptions
+	filter.ExcludePatternOptions
 
 	Parent            string
 	GroupBy           restic.SnapshotGroupByOptions
@@ -95,9 +85,10 @@ type BackupOptions struct {
 	ExcludeIfPresent  []string
 	ExcludeCaches     bool
 	ExcludeLargerThan string
-	ScopeSymlinks     string
+	ExcludeCloudFiles bool
 	Stdin             bool
 	StdinFilename     string
+	StdinCommand      bool
 	Tags              restic.TagLists
 	Host              string
 	FilesFrom         []string
@@ -111,57 +102,62 @@ type BackupOptions struct {
 	DryRun            bool
 	ReadConcurrency   uint
 	NoScan            bool
+	SkipIfUnchanged   bool
 }
 
-var backupOptions BackupOptions
+func (opts *BackupOptions) AddFlags(f *pflag.FlagSet) {
+	f.StringVar(&opts.Parent, "parent", "", "use this parent `snapshot` (default: latest snapshot in the group determined by --group-by and not newer than the timestamp determined by --time)")
+	opts.GroupBy = restic.SnapshotGroupByOptions{Host: true, Path: true}
+	f.VarP(&opts.GroupBy, "group-by", "g", "`group` snapshots by host, paths and/or tags, separated by comma (disable grouping with '')")
+	f.BoolVarP(&opts.Force, "force", "f", false, `force re-reading the source files/directories (overrides the "parent" flag)`)
 
-// ErrInvalidSourceData is used to report an incomplete backup
-var ErrInvalidSourceData = errors.New("at least one source file could not be read")
+	opts.ExcludePatternOptions.Add(f)
 
-func init() {
-	cmdRoot.AddCommand(cmdBackup)
-
-	f := cmdBackup.Flags()
-	f.StringVar(&backupOptions.Parent, "parent", "", "use this parent `snapshot` (default: latest snapshot in the group determined by --group-by and not newer than the timestamp determined by --time)")
-	backupOptions.GroupBy = restic.SnapshotGroupByOptions{Host: true, Path: true}
-	f.VarP(&backupOptions.GroupBy, "group-by", "g", "`group` snapshots by host, paths and/or tags, separated by comma (disable grouping with '')")
-	f.BoolVarP(&backupOptions.Force, "force", "f", false, `force re-reading the target files/directories (overrides the "parent" flag)`)
-
-	initExcludePatternOptions(f, &backupOptions.excludePatternOptions)
-
-	f.BoolVarP(&backupOptions.ExcludeOtherFS, "one-file-system", "x", false, "exclude other file systems, don't cross filesystem boundaries and subvolumes")
-	f.StringArrayVar(&backupOptions.ExcludeIfPresent, "exclude-if-present", nil, "takes `filename[:header]`, exclude contents of directories containing filename (except filename itself) if header of that file is as provided (can be specified multiple times)")
-	f.BoolVar(&backupOptions.ExcludeCaches, "exclude-caches", false, `excludes cache directories that are marked with a CACHEDIR.TAG file. See https://bford.info/cachedir/ for the Cache Directory Tagging Standard`)
-	f.StringVar(&backupOptions.ExcludeLargerThan, "exclude-larger-than", "", "max `size` of the files to be backed up (allowed suffixes: k/K, m/M, g/G, t/T)")
-	f.StringVar(&backupOptions.ScopeSymlinks, "scope-symlinks", "", "exclude symlinks that are targeting files outside this path")
-	f.BoolVar(&backupOptions.Stdin, "stdin", false, "read backup from stdin")
-	f.StringVar(&backupOptions.StdinFilename, "stdin-filename", "stdin", "`filename` to use when reading from stdin")
-	f.Var(&backupOptions.Tags, "tag", "add `tags` for the new snapshot in the format `tag[,tag,...]` (can be specified multiple times)")
-	f.UintVar(&backupOptions.ReadConcurrency, "read-concurrency", 0, "read `n` files concurrently (default: $RESTIC_READ_CONCURRENCY or 2)")
-	f.StringVarP(&backupOptions.Host, "host", "H", "", "set the `hostname` for the snapshot manually. To prevent an expensive rescan use the \"parent\" flag")
-	f.StringVar(&backupOptions.Host, "hostname", "", "set the `hostname` for the snapshot manually")
+	f.BoolVarP(&opts.ExcludeOtherFS, "one-file-system", "x", false, "exclude other file systems, don't cross filesystem boundaries and subvolumes")
+	f.StringArrayVar(&opts.ExcludeIfPresent, "exclude-if-present", nil, "takes `filename[:header]`, exclude contents of directories containing filename (except filename itself) if header of that file is as provided (can be specified multiple times)")
+	f.BoolVar(&opts.ExcludeCaches, "exclude-caches", false, `excludes cache directories that are marked with a CACHEDIR.TAG file. See https://bford.info/cachedir/ for the Cache Directory Tagging Standard`)
+	f.StringVar(&opts.ExcludeLargerThan, "exclude-larger-than", "", "max `size` of the files to be backed up (allowed suffixes: k/K, m/M, g/G, t/T)")
+	f.BoolVar(&opts.Stdin, "stdin", false, "read backup from stdin")
+	f.StringVar(&opts.StdinFilename, "stdin-filename", "stdin", "`filename` to use when reading from stdin")
+	f.BoolVar(&opts.StdinCommand, "stdin-from-command", false, "interpret arguments as command to execute and store its stdout")
+	f.Var(&opts.Tags, "tag", "add `tags` for the new snapshot in the format `tag[,tag,...]` (can be specified multiple times)")
+	f.UintVar(&opts.ReadConcurrency, "read-concurrency", 0, "read `n` files concurrently (default: $RESTIC_READ_CONCURRENCY or 2)")
+	f.StringVarP(&opts.Host, "host", "H", "", "set the `hostname` for the snapshot manually (default: $RESTIC_HOST). To prevent an expensive rescan use the \"parent\" flag")
+	f.StringVar(&opts.Host, "hostname", "", "set the `hostname` for the snapshot manually")
 	err := f.MarkDeprecated("hostname", "use --host")
 	if err != nil {
 		// MarkDeprecated only returns an error when the flag could not be found
 		panic(err)
 	}
-	f.StringArrayVar(&backupOptions.FilesFrom, "files-from", nil, "read the files to backup from `file` (can be combined with file args; can be specified multiple times)")
-	f.StringArrayVar(&backupOptions.FilesFromVerbatim, "files-from-verbatim", nil, "read the files to backup from `file` (can be combined with file args; can be specified multiple times)")
-	f.StringArrayVar(&backupOptions.FilesFromRaw, "files-from-raw", nil, "read the files to backup from `file` (can be combined with file args; can be specified multiple times)")
-	f.StringVar(&backupOptions.TimeStamp, "time", "", "`time` of the backup (ex. '2012-11-01 22:08:41') (default: now)")
-	f.BoolVar(&backupOptions.WithAtime, "with-atime", false, "store the atime for all files and directories")
-	f.BoolVar(&backupOptions.IgnoreInode, "ignore-inode", false, "ignore inode number changes when checking for modified files")
-	f.BoolVar(&backupOptions.IgnoreCtime, "ignore-ctime", false, "ignore ctime changes when checking for modified files")
-	f.BoolVarP(&backupOptions.DryRun, "dry-run", "n", false, "do not upload or write any data, just show what would be done")
-	f.BoolVar(&backupOptions.NoScan, "no-scan", false, "do not run scanner to estimate size of backup")
+	f.StringArrayVar(&opts.FilesFrom, "files-from", nil, "read the files to backup from `file` (can be combined with file args; can be specified multiple times)")
+	f.StringArrayVar(&opts.FilesFromVerbatim, "files-from-verbatim", nil, "read the files to backup from `file` (can be combined with file args; can be specified multiple times)")
+	f.StringArrayVar(&opts.FilesFromRaw, "files-from-raw", nil, "read the files to backup from `file` (can be combined with file args; can be specified multiple times)")
+	f.StringVar(&opts.TimeStamp, "time", "", "`time` of the backup (ex. '2012-11-01 22:08:41') (default: now)")
+	f.BoolVar(&opts.WithAtime, "with-atime", false, "store the atime for all files and directories")
+	f.BoolVar(&opts.IgnoreInode, "ignore-inode", false, "ignore inode number and ctime changes when checking for modified files")
+	f.BoolVar(&opts.IgnoreCtime, "ignore-ctime", false, "ignore ctime changes when checking for modified files")
+	f.BoolVarP(&opts.DryRun, "dry-run", "n", false, "do not upload or write any data, just show what would be done")
+	f.BoolVar(&opts.NoScan, "no-scan", false, "do not run scanner to estimate size of backup")
 	if runtime.GOOS == "windows" {
-		f.BoolVar(&backupOptions.UseFsSnapshot, "use-fs-snapshot", false, "use filesystem snapshot where possible (currently only Windows VSS)")
+		f.BoolVar(&opts.UseFsSnapshot, "use-fs-snapshot", false, "use filesystem snapshot where possible (currently only Windows VSS)")
+		f.BoolVar(&opts.ExcludeCloudFiles, "exclude-cloud-files", false, "excludes online-only cloud files (such as OneDrive Files On-Demand)")
 	}
+	f.BoolVar(&opts.SkipIfUnchanged, "skip-if-unchanged", false, "skip snapshot creation if identical to parent snapshot")
 
 	// parse read concurrency from env, on error the default value will be used
 	readConcurrency, _ := strconv.ParseUint(os.Getenv("RESTIC_READ_CONCURRENCY"), 10, 32)
-	backupOptions.ReadConcurrency = uint(readConcurrency)
+	opts.ReadConcurrency = uint(readConcurrency)
+
+	// parse host from env, if not exists or empty the default value will be used
+	if host := os.Getenv("RESTIC_HOST"); host != "" {
+		opts.Host = host
+	}
 }
+
+var backupFSTestHook func(fs fs.FS) fs.FS
+
+// ErrInvalidSourceData is used to report an incomplete backup
+var ErrInvalidSourceData = errors.New("at least one source file could not be read")
 
 // filterExisting returns a slice of all existing items, or an error if no
 // items exist at all.
@@ -177,7 +173,7 @@ func filterExisting(items []string) (result []string, err error) {
 	}
 
 	if len(result) == 0 {
-		return nil, errors.Fatal("all target directories/files do not exist")
+		return nil, errors.Fatal("all source directories/files do not exist")
 	}
 
 	return
@@ -276,7 +272,7 @@ func readFilenamesRaw(r io.Reader) (names []string, err error) {
 
 // Check returns an error when an invalid combination of options was set.
 func (opts BackupOptions) Check(gopts GlobalOptions, args []string) error {
-	if gopts.password == "" {
+	if gopts.password == "" && !gopts.InsecureNoPassword {
 		if opts.Stdin {
 			return errors.Fatal("cannot read both password and data from stdin")
 		}
@@ -289,7 +285,7 @@ func (opts BackupOptions) Check(gopts GlobalOptions, args []string) error {
 		}
 	}
 
-	if opts.Stdin {
+	if opts.Stdin || opts.StdinCommand {
 		if len(opts.FilesFrom) > 0 {
 			return errors.Fatal("--stdin and --files-from cannot be used together")
 		}
@@ -300,7 +296,7 @@ func (opts BackupOptions) Check(gopts GlobalOptions, args []string) error {
 			return errors.Fatal("--stdin and --files-from-raw cannot be used together")
 		}
 
-		if len(args) > 0 {
+		if len(args) > 0 && !opts.StdinCommand {
 			return errors.Fatal("--stdin was specified and files/dirs were listed as arguments")
 		}
 	}
@@ -310,9 +306,9 @@ func (opts BackupOptions) Check(gopts GlobalOptions, args []string) error {
 
 // collectRejectByNameFuncs returns a list of all functions which may reject data
 // from being saved in a snapshot based on path only
-func collectRejectByNameFuncs(opts BackupOptions, repo *repository.Repository) (fs []RejectByNameFunc, err error) {
+func collectRejectByNameFuncs(opts BackupOptions, repo *repository.Repository) (fs []archiver.RejectByNameFunc, err error) {
 	// exclude restic cache
-	if repo.Cache != nil {
+	if repo.Cache() != nil {
 		f, err := rejectResticCache(repo)
 		if err != nil {
 			return nil, err
@@ -321,23 +317,12 @@ func collectRejectByNameFuncs(opts BackupOptions, repo *repository.Repository) (
 		fs = append(fs, f)
 	}
 
-	fsPatterns, err := opts.excludePatternOptions.CollectPatterns()
+	fsPatterns, err := opts.ExcludePatternOptions.CollectPatterns(Warnf)
 	if err != nil {
 		return nil, err
 	}
-	fs = append(fs, fsPatterns...)
-
-	if opts.ExcludeCaches {
-		opts.ExcludeIfPresent = append(opts.ExcludeIfPresent, "CACHEDIR.TAG:Signature: 8a477f597d28d172789f06886806bc55")
-	}
-
-	for _, spec := range opts.ExcludeIfPresent {
-		f, err := rejectIfPresent(spec)
-		if err != nil {
-			return nil, err
-		}
-
-		fs = append(fs, f)
+	for _, pat := range fsPatterns {
+		fs = append(fs, archiver.RejectByNameFunc(pat))
 	}
 
 	return fs, nil
@@ -345,38 +330,59 @@ func collectRejectByNameFuncs(opts BackupOptions, repo *repository.Repository) (
 
 // collectRejectFuncs returns a list of all functions which may reject data
 // from being saved in a snapshot based on path and file info
-func collectRejectFuncs(opts BackupOptions, targets []string) (fs []RejectFunc, err error) {
+func collectRejectFuncs(opts BackupOptions, targets []string, fs fs.FS) (funcs []archiver.RejectFunc, err error) {
 	// allowed devices
-	if opts.ExcludeOtherFS && !opts.Stdin {
-		f, err := rejectByDevice(targets)
+	if opts.ExcludeOtherFS && !opts.Stdin && !opts.StdinCommand {
+		f, err := archiver.RejectByDevice(targets, fs)
 		if err != nil {
 			return nil, err
 		}
-		fs = append(fs, f)
+		funcs = append(funcs, f)
 	}
 
-	if len(opts.ExcludeLargerThan) != 0 && !opts.Stdin {
-		f, err := rejectBySize(opts.ExcludeLargerThan)
+	if len(opts.ExcludeLargerThan) != 0 && !opts.Stdin && !opts.StdinCommand {
+		maxSize, err := ui.ParseBytes(opts.ExcludeLargerThan)
 		if err != nil {
 			return nil, err
 		}
-		fs = append(fs, f)
-	}
 
-	if opts.ScopeSymlinks != "" {
-		f, err := rejectSymlinksOutsideScope(opts.ScopeSymlinks)
+		f, err := archiver.RejectBySize(maxSize)
 		if err != nil {
 			return nil, err
 		}
-		fs = append(fs, f)
+		funcs = append(funcs, f)
 	}
 
-	return fs, nil
+	if opts.ExcludeCloudFiles && !opts.Stdin && !opts.StdinCommand {
+		if runtime.GOOS != "windows" {
+			return nil, errors.Fatalf("exclude-cloud-files is only supported on Windows")
+		}
+		f, err := archiver.RejectCloudFiles(Warnf)
+		if err != nil {
+			return nil, err
+		}
+		funcs = append(funcs, f)
+	}
+
+	if opts.ExcludeCaches {
+		opts.ExcludeIfPresent = append(opts.ExcludeIfPresent, "CACHEDIR.TAG:Signature: 8a477f597d28d172789f06886806bc55")
+	}
+
+	for _, spec := range opts.ExcludeIfPresent {
+		f, err := archiver.RejectIfPresent(spec, Warnf)
+		if err != nil {
+			return nil, err
+		}
+
+		funcs = append(funcs, f)
+	}
+
+	return funcs, nil
 }
 
 // collectTargets returns a list of target files/dirs from several sources.
 func collectTargets(opts BackupOptions, args []string) (targets []string, err error) {
-	if opts.Stdin {
+	if opts.Stdin || opts.StdinCommand {
 		return nil, nil
 	}
 
@@ -430,7 +436,7 @@ func collectTargets(opts BackupOptions, args []string) (targets []string, err er
 	// and have the ability to use both files-from and args at the same time.
 	targets = append(targets, args...)
 	if len(targets) == 0 && !opts.Stdin {
-		return nil, errors.Fatal("nothing to backup, please specify target files/dirs")
+		return nil, errors.Fatal("nothing to backup, please specify source files/dirs")
 	}
 
 	targets, err = filterExisting(targets)
@@ -443,7 +449,7 @@ func collectTargets(opts BackupOptions, args []string) (targets []string, err er
 
 // parent returns the ID of the parent snapshot. If there is none, nil is
 // returned.
-func findParentSnapshot(ctx context.Context, repo restic.Repository, opts BackupOptions, targets []string, timeStampLimit time.Time) (*restic.Snapshot, error) {
+func findParentSnapshot(ctx context.Context, repo restic.ListerLoaderUnpacked, opts BackupOptions, targets []string, timeStampLimit time.Time) (*restic.Snapshot, error) {
 	if opts.Force {
 		return nil, nil
 	}
@@ -463,7 +469,7 @@ func findParentSnapshot(ctx context.Context, repo restic.Repository, opts Backup
 		f.Tags = []restic.TagList{opts.Tags.Flatten()}
 	}
 
-	sn, _, err := f.FindLatest(ctx, repo.Backend(), repo, snName)
+	sn, _, err := f.FindLatest(ctx, repo, repo, snName)
 	// Snapshot not found is ok if no explicit parent was set
 	if opts.Parent == "" && errors.Is(err, restic.ErrNoSnapshotFound) {
 		err = nil
@@ -472,7 +478,16 @@ func findParentSnapshot(ctx context.Context, repo restic.Repository, opts Backup
 }
 
 func runBackup(ctx context.Context, opts BackupOptions, gopts GlobalOptions, term *termstatus.Terminal, args []string) error {
-	err := opts.Check(gopts, args)
+	var vsscfg fs.VSSConfig
+	var err error
+
+	if runtime.GOOS == "windows" {
+		if vsscfg, err = fs.ParseVSSConfig(gopts.extended); err != nil {
+			return err
+		}
+	}
+
+	err = opts.Check(gopts, args)
 	if err != nil {
 		return err
 	}
@@ -483,6 +498,7 @@ func runBackup(ctx context.Context, opts BackupOptions, gopts GlobalOptions, ter
 	}
 
 	timeStamp := time.Now()
+	backupStart := timeStamp
 	if opts.TimeStamp != "" {
 		timeStamp, err = time.ParseInLocation(TimeFormat, opts.TimeStamp, time.Local)
 		if err != nil {
@@ -494,10 +510,11 @@ func runBackup(ctx context.Context, opts BackupOptions, gopts GlobalOptions, ter
 		Verbosef("open repository\n")
 	}
 
-	repo, err := OpenRepository(ctx, gopts)
+	ctx, repo, unlock, err := openWithAppendLock(ctx, gopts, opts.DryRun)
 	if err != nil {
 		return err
 	}
+	defer unlock()
 
 	var progressPrinter backup.ProgressPrinter
 	if gopts.JSON {
@@ -509,30 +526,8 @@ func runBackup(ctx context.Context, opts BackupOptions, gopts GlobalOptions, ter
 		calculateProgressInterval(!gopts.Quiet, gopts.JSON))
 	defer progressReporter.Done()
 
-	if opts.DryRun {
-		repo.SetDryRun()
-	}
-
-	if !gopts.JSON {
-		progressPrinter.V("lock repository")
-	}
-	if !opts.DryRun {
-		var lock *restic.Lock
-		lock, ctx, err = lockRepo(ctx, repo, gopts.RetryLock, gopts.JSON)
-		defer unlockRepo(lock)
-		if err != nil {
-			return err
-		}
-	}
-
 	// rejectByNameFuncs collect functions that can reject items from the backup based on path only
 	rejectByNameFuncs, err := collectRejectByNameFuncs(opts, repo)
-	if err != nil {
-		return err
-	}
-
-	// rejectFuncs collect functions that can reject items from the backup based on path and file info
-	rejectFuncs, err := collectRejectFuncs(opts, targets)
 	if err != nil {
 		return err
 	}
@@ -558,28 +553,9 @@ func runBackup(ctx context.Context, opts BackupOptions, gopts GlobalOptions, ter
 	}
 
 	bar := newIndexTerminalProgress(gopts.Quiet, gopts.JSON, term)
-
 	err = repo.LoadIndex(ctx, bar)
 	if err != nil {
 		return err
-	}
-
-	selectByNameFilter := func(item string) bool {
-		for _, reject := range rejectByNameFuncs {
-			if reject(item) {
-				return false
-			}
-		}
-		return true
-	}
-
-	selectFilter := func(item string, fi os.FileInfo) bool {
-		for _, reject := range rejectFuncs {
-			if reject(item, fi) {
-				return false
-			}
-		}
-		return true
 	}
 
 	var targetFS fs.FS = fs.Local{}
@@ -588,8 +564,8 @@ func runBackup(ctx context.Context, opts BackupOptions, gopts GlobalOptions, ter
 			return err
 		}
 
-		errorHandler := func(item string, err error) error {
-			return progressReporter.Error(item, err)
+		errorHandler := func(item string, err error) {
+			_ = progressReporter.Error(item, err)
 		}
 
 		messageHandler := func(msg string, args ...interface{}) {
@@ -598,23 +574,44 @@ func runBackup(ctx context.Context, opts BackupOptions, gopts GlobalOptions, ter
 			}
 		}
 
-		localVss := fs.NewLocalVss(errorHandler, messageHandler)
+		localVss := fs.NewLocalVss(errorHandler, messageHandler, vsscfg)
 		defer localVss.DeleteSnapshots()
 		targetFS = localVss
 	}
-	if opts.Stdin {
+
+	if opts.Stdin || opts.StdinCommand {
 		if !gopts.JSON {
 			progressPrinter.V("read data from stdin")
 		}
 		filename := path.Join("/", opts.StdinFilename)
+		var source io.ReadCloser = os.Stdin
+		if opts.StdinCommand {
+			source, err = fs.NewCommandReader(ctx, args, globalOptions.stderr)
+			if err != nil {
+				return err
+			}
+		}
 		targetFS = &fs.Reader{
 			ModTime:    timeStamp,
 			Name:       filename,
 			Mode:       0644,
-			ReadCloser: os.Stdin,
+			ReadCloser: source,
 		}
 		targets = []string{filename}
 	}
+
+	if backupFSTestHook != nil {
+		targetFS = backupFSTestHook(targetFS)
+	}
+
+	// rejectFuncs collect functions that can reject items from the backup based on path and file info
+	rejectFuncs, err := collectRejectFuncs(opts, targets, targetFS)
+	if err != nil {
+		return err
+	}
+
+	selectByNameFilter := archiver.CombineRejectByNames(rejectByNameFuncs)
+	selectFilter := archiver.CombineRejects(rejectFuncs)
 
 	wg, wgCtx := errgroup.WithContext(ctx)
 	cancelCtx, cancel := context.WithCancel(wgCtx)
@@ -633,14 +630,20 @@ func runBackup(ctx context.Context, opts BackupOptions, gopts GlobalOptions, ter
 		wg.Go(func() error { return sc.Scan(cancelCtx, targets) })
 	}
 
-	arch := archiver.New(repo, targetFS, archiver.Options{ReadConcurrency: backupOptions.ReadConcurrency})
+	arch := archiver.New(repo, targetFS, archiver.Options{ReadConcurrency: opts.ReadConcurrency})
 	arch.SelectByName = selectByNameFilter
 	arch.Select = selectFilter
 	arch.WithAtime = opts.WithAtime
 	success := true
 	arch.Error = func(item string, err error) error {
 		success = false
-		return progressReporter.Error(item, err)
+		reterr := progressReporter.Error(item, err)
+		// If we receive a fatal error during the execution of the snapshot,
+		// we abort the snapshot.
+		if reterr == nil && errors.IsFatal(err) {
+			reterr = err
+		}
+		return reterr
 	}
 	arch.CompleteItem = progressReporter.CompleteItem
 	arch.StartFile = progressReporter.StartFile
@@ -656,18 +659,20 @@ func runBackup(ctx context.Context, opts BackupOptions, gopts GlobalOptions, ter
 	}
 
 	snapshotOpts := archiver.SnapshotOptions{
-		Excludes:       opts.Excludes,
-		Tags:           opts.Tags.Flatten(),
-		Time:           timeStamp,
-		Hostname:       opts.Host,
-		ParentSnapshot: parentSnapshot,
-		ProgramVersion: "restic " + version,
+		Excludes:        opts.Excludes,
+		Tags:            opts.Tags.Flatten(),
+		BackupStart:     backupStart,
+		Time:            timeStamp,
+		Hostname:        opts.Host,
+		ParentSnapshot:  parentSnapshot,
+		ProgramVersion:  "restic " + version,
+		SkipIfUnchanged: opts.SkipIfUnchanged,
 	}
 
 	if !gopts.JSON {
 		progressPrinter.V("start backup on %v", targets)
 	}
-	_, id, err := arch.Snapshot(ctx, targets, snapshotOpts)
+	_, id, summary, err := arch.Snapshot(ctx, targets, snapshotOpts)
 
 	// cleanly shutdown all running goroutines
 	cancel()
@@ -681,10 +686,7 @@ func runBackup(ctx context.Context, opts BackupOptions, gopts GlobalOptions, ter
 	}
 
 	// Report finished execution
-	progressReporter.Finish(id, opts.DryRun)
-	if !gopts.JSON && !opts.DryRun {
-		progressPrinter.P("snapshot %s saved\n", id.Str())
-	}
+	progressReporter.Finish(id, summary, opts.DryRun)
 	if !success {
 		return ErrInvalidSourceData
 	}

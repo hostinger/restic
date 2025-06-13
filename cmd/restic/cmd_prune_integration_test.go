@@ -6,17 +6,32 @@ import (
 	"path/filepath"
 	"testing"
 
-	"github.com/restic/restic/internal/restic"
+	"github.com/restic/restic/internal/backend"
+	"github.com/restic/restic/internal/repository"
 	rtest "github.com/restic/restic/internal/test"
+	"github.com/restic/restic/internal/ui/termstatus"
 )
 
 func testRunPrune(t testing.TB, gopts GlobalOptions, opts PruneOptions) {
+	t.Helper()
+	rtest.OK(t, testRunPruneOutput(gopts, opts))
+}
+
+func testRunPruneMustFail(t testing.TB, gopts GlobalOptions, opts PruneOptions) {
+	t.Helper()
+	err := testRunPruneOutput(gopts, opts)
+	rtest.Assert(t, err != nil, "expected non nil error")
+}
+
+func testRunPruneOutput(gopts GlobalOptions, opts PruneOptions) error {
 	oldHook := gopts.backendTestHook
-	gopts.backendTestHook = func(r restic.Backend) (restic.Backend, error) { return newListOnceBackend(r), nil }
+	gopts.backendTestHook = func(r backend.Backend) (backend.Backend, error) { return newListOnceBackend(r), nil }
 	defer func() {
 		gopts.backendTestHook = oldHook
 	}()
-	rtest.OK(t, runPrune(context.TODO(), opts, gopts))
+	return withTermStatus(gopts, func(ctx context.Context, term *termstatus.Terminal) error {
+		return runPrune(context.TODO(), opts, gopts, term)
+	})
 }
 
 func TestPrune(t *testing.T) {
@@ -31,7 +46,7 @@ func testPruneVariants(t *testing.T, unsafeNoSpaceRecovery bool) {
 	}
 	t.Run("0"+suffix, func(t *testing.T) {
 		opts := PruneOptions{MaxUnused: "0%", unsafeRecovery: unsafeNoSpaceRecovery}
-		checkOpts := CheckOptions{ReadData: true, CheckUnused: true}
+		checkOpts := CheckOptions{ReadData: true, CheckUnused: !unsafeNoSpaceRecovery}
 		testPrune(t, opts, checkOpts)
 	})
 
@@ -47,8 +62,8 @@ func testPruneVariants(t *testing.T, unsafeNoSpaceRecovery bool) {
 		testPrune(t, opts, checkOpts)
 	})
 
-	t.Run("CachableOnly"+suffix, func(t *testing.T) {
-		opts := PruneOptions{MaxUnused: "5%", RepackCachableOnly: true, unsafeRecovery: unsafeNoSpaceRecovery}
+	t.Run("CacheableOnly"+suffix, func(t *testing.T) {
+		opts := PruneOptions{MaxUnused: "5%", RepackCacheableOnly: true, unsafeRecovery: unsafeNoSpaceRecovery}
 		checkOpts := CheckOptions{ReadData: true}
 		testPrune(t, opts, checkOpts)
 	})
@@ -71,7 +86,7 @@ func createPrunableRepo(t *testing.T, env *testEnvironment) {
 	testListSnapshots(t, env.gopts, 3)
 
 	testRunForgetJSON(t, env.gopts)
-	testRunForget(t, env.gopts, firstSnapshot.String())
+	testRunForget(t, env.gopts, ForgetOptions{}, firstSnapshot.String())
 }
 
 func testRunForgetJSON(t testing.TB, gopts GlobalOptions, args ...string) {
@@ -81,7 +96,12 @@ func testRunForgetJSON(t testing.TB, gopts GlobalOptions, args ...string) {
 			DryRun: true,
 			Last:   1,
 		}
-		return runForget(context.TODO(), opts, gopts, args)
+		pruneOpts := PruneOptions{
+			MaxUnused: "5%",
+		}
+		return withTermStatus(gopts, func(ctx context.Context, term *termstatus.Terminal) error {
+			return runForget(context.TODO(), opts, pruneOpts, gopts, term, args)
+		})
 	})
 	rtest.OK(t, err)
 
@@ -102,7 +122,10 @@ func testPrune(t *testing.T, pruneOpts PruneOptions, checkOpts CheckOptions) {
 
 	createPrunableRepo(t, env)
 	testRunPrune(t, env.gopts, pruneOpts)
-	rtest.OK(t, runCheck(context.TODO(), checkOpts, env.gopts, nil))
+	rtest.OK(t, withTermStatus(env.gopts, func(ctx context.Context, term *termstatus.Terminal) error {
+		_, err := runCheck(context.TODO(), checkOpts, env.gopts, nil, term)
+		return err
+	}))
 }
 
 var pruneDefaultOptions = PruneOptions{MaxUnused: "5%"}
@@ -120,7 +143,7 @@ func TestPruneWithDamagedRepository(t *testing.T) {
 	// create and delete snapshot to create unused blobs
 	testRunBackup(t, "", []string{filepath.Join(env.testdata, "0", "0", "9", "2")}, opts, env.gopts)
 	firstSnapshot := testListSnapshots(t, env.gopts, 1)[0]
-	testRunForget(t, env.gopts, firstSnapshot.String())
+	testRunForget(t, env.gopts, ForgetOptions{}, firstSnapshot.String())
 
 	oldPacks := listPacks(env.gopts, t)
 
@@ -130,13 +153,14 @@ func TestPruneWithDamagedRepository(t *testing.T) {
 	removePacksExcept(env.gopts, t, oldPacks, false)
 
 	oldHook := env.gopts.backendTestHook
-	env.gopts.backendTestHook = func(r restic.Backend) (restic.Backend, error) { return newListOnceBackend(r), nil }
+	env.gopts.backendTestHook = func(r backend.Backend) (backend.Backend, error) { return newListOnceBackend(r), nil }
 	defer func() {
 		env.gopts.backendTestHook = oldHook
 	}()
 	// prune should fail
-	rtest.Assert(t, runPrune(context.TODO(), pruneDefaultOptions, env.gopts) == errorPacksMissing,
-		"prune should have reported index not complete error")
+	rtest.Equals(t, repository.ErrPacksMissing, withTermStatus(env.gopts, func(ctx context.Context, term *termstatus.Terminal) error {
+		return runPrune(context.TODO(), pruneDefaultOptions, env.gopts, term)
+	}), "prune should have reported index not complete error")
 }
 
 // Test repos for edge cases
@@ -207,7 +231,10 @@ func testEdgeCaseRepo(t *testing.T, tarfile string, optionsCheck CheckOptions, o
 	if checkOK {
 		testRunCheck(t, env.gopts)
 	} else {
-		rtest.Assert(t, runCheck(context.TODO(), optionsCheck, env.gopts, nil) != nil,
+		rtest.Assert(t, withTermStatus(env.gopts, func(ctx context.Context, term *termstatus.Terminal) error {
+			_, err := runCheck(context.TODO(), optionsCheck, env.gopts, nil, term)
+			return err
+		}) != nil,
 			"check should have reported an error")
 	}
 
@@ -215,7 +242,26 @@ func testEdgeCaseRepo(t *testing.T, tarfile string, optionsCheck CheckOptions, o
 		testRunPrune(t, env.gopts, optionsPrune)
 		testRunCheck(t, env.gopts)
 	} else {
-		rtest.Assert(t, runPrune(context.TODO(), optionsPrune, env.gopts) != nil,
+		rtest.Assert(t, withTermStatus(env.gopts, func(ctx context.Context, term *termstatus.Terminal) error {
+			return runPrune(context.TODO(), optionsPrune, env.gopts, term)
+		}) != nil,
 			"prune should have reported an error")
 	}
+}
+
+func TestPruneRepackSmallerThanSmoke(t *testing.T) {
+	env, cleanup := withTestEnvironment(t)
+	defer cleanup()
+
+	// the implementation is already unit tested, so just check that
+	// the setting reaches its goal
+	createPrunableRepo(t, env)
+	testRunPrune(t, env.gopts, PruneOptions{
+		SmallPackSize: "4M",
+		MaxUnused:     "5%",
+	})
+	testRunPruneMustFail(t, env.gopts, PruneOptions{
+		SmallPackSize: "500M",
+		MaxUnused:     "5%",
+	})
 }

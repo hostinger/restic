@@ -8,8 +8,6 @@ import (
 	"path/filepath"
 	"runtime"
 	"strings"
-
-	"github.com/restic/restic/internal/fs"
 )
 
 var opts struct {
@@ -46,7 +44,7 @@ func initDebugLogger() {
 
 	fmt.Fprintf(os.Stderr, "debug log file %v\n", debugfile)
 
-	f, err := fs.OpenFile(debugfile, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0600)
+	f, err := os.OpenFile(debugfile, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0600)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "unable to open debug log file: %v\n", err)
 		os.Exit(2)
@@ -122,7 +120,7 @@ func goroutineNum() int {
 	runtime.Stack(b, false)
 	var num int
 
-	fmt.Sscanf(string(b), "goroutine %d ", &num)
+	_, _ = fmt.Sscanf(string(b), "goroutine %d ", &num)
 	return num
 }
 

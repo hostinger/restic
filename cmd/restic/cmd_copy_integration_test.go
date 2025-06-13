@@ -13,10 +13,12 @@ func testRunCopy(t testing.TB, srcGopts GlobalOptions, dstGopts GlobalOptions) {
 	gopts := srcGopts
 	gopts.Repo = dstGopts.Repo
 	gopts.password = dstGopts.password
+	gopts.InsecureNoPassword = dstGopts.InsecureNoPassword
 	copyOpts := CopyOptions{
 		secondaryRepoOptions: secondaryRepoOptions{
-			Repo:     srcGopts.Repo,
-			password: srcGopts.password,
+			Repo:               srcGopts.Repo,
+			password:           srcGopts.password,
+			InsecureNoPassword: srcGopts.InsecureNoPassword,
 		},
 	}
 
@@ -60,11 +62,11 @@ func TestCopy(t *testing.T) {
 	for i, snapshotID := range snapshotIDs {
 		restoredir := filepath.Join(env.base, fmt.Sprintf("restore%d", i))
 		origRestores[restoredir] = struct{}{}
-		testRunRestore(t, env.gopts, restoredir, snapshotID)
+		testRunRestore(t, env.gopts, restoredir, snapshotID.String())
 	}
 	for i, snapshotID := range copiedSnapshotIDs {
 		restoredir := filepath.Join(env2.base, fmt.Sprintf("restore%d", i))
-		testRunRestore(t, env2.gopts, restoredir, snapshotID)
+		testRunRestore(t, env2.gopts, restoredir, snapshotID.String())
 		foundMatch := false
 		for cmpdir := range origRestores {
 			diff := directoriesContentsDiff(restoredir, cmpdir)
@@ -133,4 +135,23 @@ func TestCopyUnstableJSON(t *testing.T) {
 	testRunCopy(t, env.gopts, env2.gopts)
 	testRunCheck(t, env2.gopts)
 	testListSnapshots(t, env2.gopts, 1)
+}
+
+func TestCopyToEmptyPassword(t *testing.T) {
+	env, cleanup := withTestEnvironment(t)
+	defer cleanup()
+	env2, cleanup2 := withTestEnvironment(t)
+	defer cleanup2()
+	env2.gopts.password = ""
+	env2.gopts.InsecureNoPassword = true
+
+	testSetupBackupData(t, env)
+	testRunBackup(t, "", []string{filepath.Join(env.testdata, "0", "0", "9")}, BackupOptions{}, env.gopts)
+
+	testRunInit(t, env2.gopts)
+	testRunCopy(t, env.gopts, env2.gopts)
+
+	testListSnapshots(t, env.gopts, 1)
+	testListSnapshots(t, env2.gopts, 1)
+	testRunCheck(t, env2.gopts)
 }

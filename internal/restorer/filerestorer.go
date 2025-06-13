@@ -2,23 +2,19 @@ package restorer
 
 import (
 	"context"
+	"fmt"
 	"path/filepath"
 	"sync"
 
 	"golang.org/x/sync/errgroup"
 
-	"github.com/restic/restic/internal/crypto"
 	"github.com/restic/restic/internal/debug"
 	"github.com/restic/restic/internal/errors"
+	"github.com/restic/restic/internal/feature"
 	"github.com/restic/restic/internal/repository"
 	"github.com/restic/restic/internal/restic"
 	"github.com/restic/restic/internal/ui/restore"
 )
-
-// TODO if a blob is corrupt, there may be good blob copies in other packs
-// TODO evaluate if it makes sense to split download and processing workers
-//      pro: can (slowly) read network and decrypt/write files concurrently
-//      con: each worker needs to keep one pack in memory
 
 const (
 	largeFileBlobCount = 25
@@ -32,6 +28,7 @@ type fileInfo struct {
 	size       int64
 	location   string      // file on local filesystem relative to restorer basedir
 	blobs      interface{} // blobs of the file
+	state      *fileState
 }
 
 type fileBlobInfo struct {
@@ -45,11 +42,15 @@ type packInfo struct {
 	files map[*fileInfo]struct{} // set of files that use blobs from this pack
 }
 
+type blobsLoaderFn func(ctx context.Context, packID restic.ID, blobs []restic.Blob, handleBlobFn func(blob restic.BlobHandle, buf []byte, err error) error) error
+type startWarmupFn func(context.Context, restic.IDSet) (restic.WarmupJob, error)
+
 // fileRestorer restores set of files
 type fileRestorer struct {
-	key        *crypto.Key
-	idx        func(restic.BlobHandle) []restic.PackedBlob
-	packLoader repository.BackendLoadFn
+	idx         func(restic.BlobType, restic.ID) []restic.PackedBlob
+	blobsLoader blobsLoaderFn
+
+	startWarmup startWarmupFn
 
 	workerCount int
 	filesWriter *filesWriter
@@ -57,55 +58,64 @@ type fileRestorer struct {
 	sparse      bool
 	progress    *restore.Progress
 
+	allowRecursiveDelete bool
+
 	dst   string
 	files []*fileInfo
 	Error func(string, error) error
+	Info  func(string)
 }
 
 func newFileRestorer(dst string,
-	packLoader repository.BackendLoadFn,
-	key *crypto.Key,
-	idx func(restic.BlobHandle) []restic.PackedBlob,
+	blobsLoader blobsLoaderFn,
+	idx func(restic.BlobType, restic.ID) []restic.PackedBlob,
 	connections uint,
 	sparse bool,
+	allowRecursiveDelete bool,
+	startWarmup startWarmupFn,
 	progress *restore.Progress) *fileRestorer {
 
 	// as packs are streamed the concurrency is limited by IO
 	workerCount := int(connections)
 
 	return &fileRestorer{
-		key:         key,
-		idx:         idx,
-		packLoader:  packLoader,
-		filesWriter: newFilesWriter(workerCount),
-		zeroChunk:   repository.ZeroChunk(),
-		sparse:      sparse,
-		progress:    progress,
-		workerCount: workerCount,
-		dst:         dst,
-		Error:       restorerAbortOnAllErrors,
+		idx:                  idx,
+		blobsLoader:          blobsLoader,
+		startWarmup:          startWarmup,
+		filesWriter:          newFilesWriter(workerCount, allowRecursiveDelete),
+		zeroChunk:            repository.ZeroChunk(),
+		sparse:               sparse,
+		progress:             progress,
+		allowRecursiveDelete: allowRecursiveDelete,
+		workerCount:          workerCount,
+		dst:                  dst,
+		Error:                restorerAbortOnAllErrors,
+		Info:                 func(_ string) {},
 	}
 }
 
-func (r *fileRestorer) addFile(location string, content restic.IDs, size int64) {
-	r.files = append(r.files, &fileInfo{location: location, blobs: content, size: size})
+func (r *fileRestorer) addFile(location string, content restic.IDs, size int64, state *fileState) {
+	r.files = append(r.files, &fileInfo{location: location, blobs: content, size: size, state: state})
 }
 
 func (r *fileRestorer) targetPath(location string) string {
 	return filepath.Join(r.dst, location)
 }
 
-func (r *fileRestorer) forEachBlob(blobIDs []restic.ID, fn func(packID restic.ID, packBlob restic.Blob)) error {
+func (r *fileRestorer) forEachBlob(blobIDs []restic.ID, fn func(packID restic.ID, packBlob restic.Blob, idx int, fileOffset int64)) error {
 	if len(blobIDs) == 0 {
 		return nil
 	}
 
-	for _, blobID := range blobIDs {
-		packs := r.idx(restic.BlobHandle{ID: blobID, Type: restic.DataBlob})
+	fileOffset := int64(0)
+	for i, blobID := range blobIDs {
+		packs := r.idx(restic.DataBlob, blobID)
 		if len(packs) == 0 {
 			return errors.Errorf("Unknown blob %s", blobID.String())
 		}
-		fn(packs[0].PackID, packs[0].Blob)
+		pb := packs[0]
+		fn(pb.PackID, pb.Blob, i, fileOffset)
+		fileOffset += int64(pb.DataLength())
 	}
 
 	return nil
@@ -121,17 +131,28 @@ func (r *fileRestorer) restoreFiles(ctx context.Context) error {
 
 	// create packInfo from fileInfo
 	for _, file := range r.files {
+		if ctx.Err() != nil {
+			return ctx.Err()
+		}
+
 		fileBlobs := file.blobs.(restic.IDs)
 		largeFile := len(fileBlobs) > largeFileBlobCount
 		var packsMap map[restic.ID][]fileBlobInfo
 		if largeFile {
 			packsMap = make(map[restic.ID][]fileBlobInfo)
+			file.blobs = packsMap
 		}
-		fileOffset := int64(0)
-		err := r.forEachBlob(fileBlobs, func(packID restic.ID, blob restic.Blob) {
-			if largeFile {
-				packsMap[packID] = append(packsMap[packID], fileBlobInfo{id: blob.ID, offset: fileOffset})
-				fileOffset += int64(blob.DataLength())
+		restoredBlobs := false
+		err := r.forEachBlob(fileBlobs, func(packID restic.ID, blob restic.Blob, idx int, fileOffset int64) {
+			if !file.state.HasMatchingBlob(idx) {
+				if largeFile {
+					packsMap[packID] = append(packsMap[packID], fileBlobInfo{id: blob.ID, offset: fileOffset})
+				}
+				restoredBlobs = true
+			} else {
+				r.reportBlobProgress(file, uint64(blob.DataLength()))
+				// completely ignore blob
+				return
 			}
 			pack, ok := packs[packID]
 			if !ok {
@@ -147,18 +168,49 @@ func (r *fileRestorer) restoreFiles(ctx context.Context) error {
 				file.sparse = r.sparse
 			}
 		})
+		if err != nil {
+			// repository index is messed up, can't do anything
+			return err
+		}
+
 		if len(fileBlobs) == 1 {
 			// no need to preallocate files with a single block, thus we can always consider them to be sparse
 			// in addition, a short chunk will never match r.zeroChunk which would prevent sparseness for short files
 			file.sparse = r.sparse
 		}
+		if file.state != nil {
+			// The restorer currently cannot punch new holes into an existing files.
+			// Thus sections that contained data but should be sparse after restoring
+			// the snapshot would still contain the old data resulting in a corrupt restore.
+			file.sparse = false
+		}
 
+		// empty file or one with already uptodate content. Make sure that the file size is correct
+		if !restoredBlobs {
+			err := r.truncateFileToSize(file.location, file.size)
+			if errFile := r.sanitizeError(file, err); errFile != nil {
+				return errFile
+			}
+
+			// the progress events were already sent for non-zero size files
+			if file.size == 0 {
+				r.reportBlobProgress(file, 0)
+			}
+		}
+	}
+	// drop no longer necessary file list
+	r.files = nil
+
+	if feature.Flag.Enabled(feature.S3Restore) {
+		warmupJob, err := r.startWarmup(ctx, restic.NewIDSet(packOrder...))
 		if err != nil {
-			// repository index is messed up, can't do anything
 			return err
 		}
-		if largeFile {
-			file.blobs = packsMap
+		if warmupJob.HandleCount() != 0 {
+			r.Info(fmt.Sprintf("warming up %d packs from cold storage, this may take a while...", warmupJob.HandleCount()))
+			if err := warmupJob.Wait(ctx); err != nil {
+				return err
+			}
 		}
 	}
 
@@ -179,6 +231,7 @@ func (r *fileRestorer) restoreFiles(ctx context.Context) error {
 
 	// the main restore loop
 	wg.Go(func() error {
+		defer close(downloadCh)
 		for _, id := range packOrder {
 			pack := packs[id]
 			// allow garbage collection of packInfo
@@ -190,37 +243,43 @@ func (r *fileRestorer) restoreFiles(ctx context.Context) error {
 				debug.Log("Scheduled download pack %s", pack.id.Str())
 			}
 		}
-		close(downloadCh)
 		return nil
 	})
 
 	return wg.Wait()
 }
 
-func (r *fileRestorer) downloadPack(ctx context.Context, pack *packInfo) error {
+func (r *fileRestorer) truncateFileToSize(location string, size int64) error {
+	f, err := createFile(r.targetPath(location), size, false, r.allowRecursiveDelete)
+	if err != nil {
+		return err
+	}
+	return f.Close()
+}
 
+type blobToFileOffsetsMapping map[restic.ID]struct {
+	files map[*fileInfo][]int64 // file -> offsets (plural!) of the blob in the file
+	blob  restic.Blob
+}
+
+func (r *fileRestorer) downloadPack(ctx context.Context, pack *packInfo) error {
 	// calculate blob->[]files->[]offsets mappings
-	blobs := make(map[restic.ID]struct {
-		files map[*fileInfo][]int64 // file -> offsets (plural!) of the blob in the file
-	})
-	var blobList []restic.Blob
+	blobs := make(blobToFileOffsetsMapping)
 	for file := range pack.files {
 		addBlob := func(blob restic.Blob, fileOffset int64) {
 			blobInfo, ok := blobs[blob.ID]
 			if !ok {
 				blobInfo.files = make(map[*fileInfo][]int64)
-				blobList = append(blobList, blob)
+				blobInfo.blob = blob
 				blobs[blob.ID] = blobInfo
 			}
 			blobInfo.files[file] = append(blobInfo.files[file], fileOffset)
 		}
 		if fileBlobs, ok := file.blobs.(restic.IDs); ok {
-			fileOffset := int64(0)
-			err := r.forEachBlob(fileBlobs, func(packID restic.ID, blob restic.Blob) {
-				if packID.Equal(pack.id) {
+			err := r.forEachBlob(fileBlobs, func(packID restic.ID, blob restic.Blob, idx int, fileOffset int64) {
+				if packID.Equal(pack.id) && !file.state.HasMatchingBlob(idx) {
 					addBlob(blob, fileOffset)
 				}
-				fileOffset += int64(blob.DataLength())
 			})
 			if err != nil {
 				// restoreFiles should have caught this error before
@@ -228,7 +287,7 @@ func (r *fileRestorer) downloadPack(ctx context.Context, pack *packInfo) error {
 			}
 		} else if packsMap, ok := file.blobs.(map[restic.ID][]fileBlobInfo); ok {
 			for _, blob := range packsMap[pack.id] {
-				idxPacks := r.idx(restic.BlobHandle{ID: blob.id, Type: restic.DataBlob})
+				idxPacks := r.idx(restic.DataBlob, blob.id)
 				for _, idxPack := range idxPacks {
 					if idxPack.PackID.Equal(pack.id) {
 						addBlob(idxPack.Blob, blob.offset)
@@ -239,65 +298,106 @@ func (r *fileRestorer) downloadPack(ctx context.Context, pack *packInfo) error {
 		}
 	}
 
-	sanitizeError := func(file *fileInfo, err error) error {
-		if err != nil {
-			err = r.Error(file.location, err)
-		}
+	// track already processed blobs for precise error reporting
+	processedBlobs := restic.NewBlobSet()
+	err := r.downloadBlobs(ctx, pack.id, blobs, processedBlobs)
+	return r.reportError(blobs, processedBlobs, err)
+}
+
+func (r *fileRestorer) sanitizeError(file *fileInfo, err error) error {
+	switch err {
+	case nil, context.Canceled, context.DeadlineExceeded:
+		// Context errors are permanent.
 		return err
+	default:
+		return r.Error(file.location, err)
+	}
+}
+
+func (r *fileRestorer) reportError(blobs blobToFileOffsetsMapping, processedBlobs restic.BlobSet, err error) error {
+	if err == nil {
+		return nil
 	}
 
-	err := repository.StreamPack(ctx, r.packLoader, r.key, pack.id, blobList, func(h restic.BlobHandle, blobData []byte, err error) error {
-		blob := blobs[h.ID]
-		if err != nil {
-			for file := range blob.files {
-				if errFile := sanitizeError(file, err); errFile != nil {
-					return errFile
+	// only report error for not yet processed blobs
+	affectedFiles := make(map[*fileInfo]struct{})
+	for _, entry := range blobs {
+		if processedBlobs.Has(entry.blob.BlobHandle) {
+			continue
+		}
+		for file := range entry.files {
+			affectedFiles[file] = struct{}{}
+		}
+	}
+
+	for file := range affectedFiles {
+		if errFile := r.sanitizeError(file, err); errFile != nil {
+			return errFile
+		}
+	}
+	return nil
+}
+
+func (r *fileRestorer) downloadBlobs(ctx context.Context, packID restic.ID,
+	blobs blobToFileOffsetsMapping, processedBlobs restic.BlobSet) error {
+
+	blobList := make([]restic.Blob, 0, len(blobs))
+	for _, entry := range blobs {
+		blobList = append(blobList, entry.blob)
+	}
+	return r.blobsLoader(ctx, packID, blobList,
+		func(h restic.BlobHandle, blobData []byte, err error) error {
+			processedBlobs.Insert(h)
+			blob := blobs[h.ID]
+			if err != nil {
+				for file := range blob.files {
+					if errFile := r.sanitizeError(file, err); errFile != nil {
+						return errFile
+					}
+				}
+				return nil
+			}
+			for file, offsets := range blob.files {
+				for _, offset := range offsets {
+					// avoid long cancellation delays for frequently used blobs
+					if ctx.Err() != nil {
+						return ctx.Err()
+					}
+
+					writeToFile := func() error {
+						// this looks overly complicated and needs explanation
+						// two competing requirements:
+						// - must create the file once and only once
+						// - should allow concurrent writes to the file
+						// so write the first blob while holding file lock
+						// write other blobs after releasing the lock
+						createSize := int64(-1)
+						file.lock.Lock()
+						if file.inProgress {
+							file.lock.Unlock()
+						} else {
+							defer file.lock.Unlock()
+							file.inProgress = true
+							createSize = file.size
+						}
+						writeErr := r.filesWriter.writeToFile(r.targetPath(file.location), blobData, offset, createSize, file.sparse)
+						r.reportBlobProgress(file, uint64(len(blobData)))
+						return writeErr
+					}
+					err := r.sanitizeError(file, writeToFile())
+					if err != nil {
+						return err
+					}
 				}
 			}
 			return nil
-		}
-		for file, offsets := range blob.files {
-			for _, offset := range offsets {
-				writeToFile := func() error {
-					// this looks overly complicated and needs explanation
-					// two competing requirements:
-					// - must create the file once and only once
-					// - should allow concurrent writes to the file
-					// so write the first blob while holding file lock
-					// write other blobs after releasing the lock
-					createSize := int64(-1)
-					file.lock.Lock()
-					if file.inProgress {
-						file.lock.Unlock()
-					} else {
-						defer file.lock.Unlock()
-						file.inProgress = true
-						createSize = file.size
-					}
-					writeErr := r.filesWriter.writeToFile(r.targetPath(file.location), blobData, offset, createSize, file.sparse)
+		})
+}
 
-					if r.progress != nil {
-						r.progress.AddProgress(file.location, uint64(len(blobData)), uint64(file.size))
-					}
-
-					return writeErr
-				}
-				err := sanitizeError(file, writeToFile())
-				if err != nil {
-					return err
-				}
-			}
-		}
-		return nil
-	})
-
-	if err != nil {
-		for file := range pack.files {
-			if errFile := sanitizeError(file, err); errFile != nil {
-				return errFile
-			}
-		}
+func (r *fileRestorer) reportBlobProgress(file *fileInfo, blobSize uint64) {
+	action := restore.ActionFileUpdated
+	if file.state == nil {
+		action = restore.ActionFileRestored
 	}
-
-	return nil
+	r.progress.AddProgress(file.location, action, blobSize, uint64(file.size))
 }

@@ -7,18 +7,21 @@ import (
 	"reflect"
 	"sort"
 
-	"github.com/restic/restic/internal/backend"
 	"github.com/restic/restic/internal/debug"
 	"github.com/restic/restic/internal/errors"
 	"github.com/restic/restic/internal/restic"
 	"github.com/restic/restic/internal/ui"
 	"github.com/spf13/cobra"
+	"github.com/spf13/pflag"
 )
 
-var cmdDiff = &cobra.Command{
-	Use:   "diff [flags] snapshotID snapshotID",
-	Short: "Show differences between two snapshots",
-	Long: `
+func newDiffCommand() *cobra.Command {
+	var opts DiffOptions
+
+	cmd := &cobra.Command{
+		Use:   "diff [flags] snapshotID snapshotID",
+		Short: "Show differences between two snapshots",
+		Long: `
 The "diff" command shows differences from the first to the second snapshot. The
 first characters in each line display what has happened to a particular file or
 directory:
@@ -28,20 +31,33 @@ directory:
 * U  The metadata (access mode, timestamps, ...) for the item was updated
 * M  The file's content was modified
 * T  The type was changed, e.g. a file was made a symlink
+* ?  Bitrot detected: The file's content has changed but all metadata is the same
+
+Metadata comparison will likely not work if a backup was created using the
+'--ignore-inode' or '--ignore-ctime' option.
 
 To only compare files in specific subfolders, you can use the
-"<snapshotID>:<subfolder>" syntax, where "subfolder" is a path within the
+"snapshotID:subfolder" syntax, where "subfolder" is a path within the
 snapshot.
 
 EXIT STATUS
 ===========
 
-Exit status is 0 if the command was successful, and non-zero if there was any error.
+Exit status is 0 if the command was successful.
+Exit status is 1 if there was any error.
+Exit status is 10 if the repository does not exist.
+Exit status is 11 if the repository is already locked.
+Exit status is 12 if the password is incorrect.
 `,
-	DisableAutoGenTag: true,
-	RunE: func(cmd *cobra.Command, args []string) error {
-		return runDiff(cmd.Context(), diffOptions, globalOptions, args)
-	},
+		GroupID:           cmdGroupDefault,
+		DisableAutoGenTag: true,
+		RunE: func(cmd *cobra.Command, args []string) error {
+			return runDiff(cmd.Context(), opts, globalOptions, args)
+		},
+	}
+
+	opts.AddFlags(cmd.Flags())
+	return cmd
 }
 
 // DiffOptions collects all options for the diff command.
@@ -49,16 +65,11 @@ type DiffOptions struct {
 	ShowMetadata bool
 }
 
-var diffOptions DiffOptions
-
-func init() {
-	cmdRoot.AddCommand(cmdDiff)
-
-	f := cmdDiff.Flags()
-	f.BoolVar(&diffOptions.ShowMetadata, "metadata", false, "print changes in metadata")
+func (opts *DiffOptions) AddFlags(f *pflag.FlagSet) {
+	f.BoolVar(&opts.ShowMetadata, "metadata", false, "print changes in metadata")
 }
 
-func loadSnapshot(ctx context.Context, be restic.Lister, repo restic.Repository, desc string) (*restic.Snapshot, string, error) {
+func loadSnapshot(ctx context.Context, be restic.Lister, repo restic.LoaderUnpacked, desc string) (*restic.Snapshot, string, error) {
 	sn, subfolder, err := restic.FindSnapshot(ctx, be, repo, desc)
 	if err != nil {
 		return nil, "", errors.Fatal(err.Error())
@@ -68,7 +79,7 @@ func loadSnapshot(ctx context.Context, be restic.Lister, repo restic.Repository,
 
 // Comparer collects all things needed to compare two snapshots.
 type Comparer struct {
-	repo        restic.Repository
+	repo        restic.BlobLoader
 	opts        DiffOptions
 	printChange func(change *Change)
 }
@@ -100,9 +111,9 @@ func (s *DiffStat) Add(node *restic.Node) {
 	}
 
 	switch node.Type {
-	case "file":
+	case restic.NodeTypeFile:
 		s.Files++
-	case "dir":
+	case restic.NodeTypeDir:
 		s.Dirs++
 	default:
 		s.Others++
@@ -116,7 +127,7 @@ func addBlobs(bs restic.BlobSet, node *restic.Node) {
 	}
 
 	switch node.Type {
-	case "file":
+	case restic.NodeTypeFile:
 		for _, blob := range node.Content {
 			h := restic.BlobHandle{
 				ID:   blob,
@@ -124,7 +135,7 @@ func addBlobs(bs restic.BlobSet, node *restic.Node) {
 			}
 			bs.Insert(h)
 		}
-	case "dir":
+	case restic.NodeTypeDir:
 		h := restic.BlobHandle{
 			ID:   *node.Subtree,
 			Type: restic.TreeBlob,
@@ -144,7 +155,7 @@ type DiffStatsContainer struct {
 }
 
 // updateBlobs updates the blob counters in the stats struct.
-func updateBlobs(repo restic.Repository, blobs restic.BlobSet, stats *DiffStat) {
+func updateBlobs(repo restic.Loader, blobs restic.BlobSet, stats *DiffStat) {
 	for h := range blobs {
 		switch h.Type {
 		case restic.DataBlob:
@@ -153,7 +164,7 @@ func updateBlobs(repo restic.Repository, blobs restic.BlobSet, stats *DiffStat) 
 			stats.TreeBlobs++
 		}
 
-		size, found := repo.LookupBlobSize(h.ID, h.Type)
+		size, found := repo.LookupBlobSize(h.Type, h.ID)
 		if !found {
 			Warnf("unable to find blob size for %v\n", h)
 			continue
@@ -171,23 +182,27 @@ func (c *Comparer) printDir(ctx context.Context, mode string, stats *DiffStat, b
 	}
 
 	for _, node := range tree.Nodes {
+		if ctx.Err() != nil {
+			return ctx.Err()
+		}
+
 		name := path.Join(prefix, node.Name)
-		if node.Type == "dir" {
+		if node.Type == restic.NodeTypeDir {
 			name += "/"
 		}
 		c.printChange(NewChange(name, mode))
 		stats.Add(node)
 		addBlobs(blobs, node)
 
-		if node.Type == "dir" {
+		if node.Type == restic.NodeTypeDir {
 			err := c.printDir(ctx, mode, stats, blobs, name, *node.Subtree)
-			if err != nil {
+			if err != nil && err != context.Canceled {
 				Warnf("error: %v\n", err)
 			}
 		}
 	}
 
-	return nil
+	return ctx.Err()
 }
 
 func (c *Comparer) collectDir(ctx context.Context, blobs restic.BlobSet, id restic.ID) error {
@@ -198,17 +213,21 @@ func (c *Comparer) collectDir(ctx context.Context, blobs restic.BlobSet, id rest
 	}
 
 	for _, node := range tree.Nodes {
+		if ctx.Err() != nil {
+			return ctx.Err()
+		}
+
 		addBlobs(blobs, node)
 
-		if node.Type == "dir" {
+		if node.Type == restic.NodeTypeDir {
 			err := c.collectDir(ctx, blobs, *node.Subtree)
-			if err != nil {
+			if err != nil && err != context.Canceled {
 				Warnf("error: %v\n", err)
 			}
 		}
 	}
 
-	return nil
+	return ctx.Err()
 }
 
 func uniqueNodeNames(tree1, tree2 *restic.Tree) (tree1Nodes, tree2Nodes map[string]*restic.Node, uniqueNames []string) {
@@ -249,6 +268,10 @@ func (c *Comparer) diffTree(ctx context.Context, stats *DiffStatsContainer, pref
 	tree1Nodes, tree2Nodes, names := uniqueNodeNames(tree1, tree2)
 
 	for _, name := range names {
+		if ctx.Err() != nil {
+			return ctx.Err()
+		}
+
 		node1, t1 := tree1Nodes[name]
 		node2, t2 := tree2Nodes[name]
 
@@ -264,15 +287,25 @@ func (c *Comparer) diffTree(ctx context.Context, stats *DiffStatsContainer, pref
 				mod += "T"
 			}
 
-			if node2.Type == "dir" {
+			if node2.Type == restic.NodeTypeDir {
 				name += "/"
 			}
 
-			if node1.Type == "file" &&
-				node2.Type == "file" &&
+			if node1.Type == restic.NodeTypeFile &&
+				node2.Type == restic.NodeTypeFile &&
 				!reflect.DeepEqual(node1.Content, node2.Content) {
 				mod += "M"
 				stats.ChangedFiles++
+
+				node1NilContent := *node1
+				node2NilContent := *node2
+				node1NilContent.Content = nil
+				node2NilContent.Content = nil
+				// the bitrot detection may not work if `backup --ignore-inode` or `--ignore-ctime` were used
+				if node1NilContent.Equals(node2NilContent) {
+					// probable bitrot detected
+					mod += "?"
+				}
 			} else if c.opts.ShowMetadata && !node1.Equals(*node2) {
 				mod += "U"
 			}
@@ -281,49 +314,49 @@ func (c *Comparer) diffTree(ctx context.Context, stats *DiffStatsContainer, pref
 				c.printChange(NewChange(name, mod))
 			}
 
-			if node1.Type == "dir" && node2.Type == "dir" {
+			if node1.Type == restic.NodeTypeDir && node2.Type == restic.NodeTypeDir {
 				var err error
 				if (*node1.Subtree).Equal(*node2.Subtree) {
 					err = c.collectDir(ctx, stats.BlobsCommon, *node1.Subtree)
 				} else {
 					err = c.diffTree(ctx, stats, name, *node1.Subtree, *node2.Subtree)
 				}
-				if err != nil {
+				if err != nil && err != context.Canceled {
 					Warnf("error: %v\n", err)
 				}
 			}
 		case t1 && !t2:
 			prefix := path.Join(prefix, name)
-			if node1.Type == "dir" {
+			if node1.Type == restic.NodeTypeDir {
 				prefix += "/"
 			}
 			c.printChange(NewChange(prefix, "-"))
 			stats.Removed.Add(node1)
 
-			if node1.Type == "dir" {
+			if node1.Type == restic.NodeTypeDir {
 				err := c.printDir(ctx, "-", &stats.Removed, stats.BlobsBefore, prefix, *node1.Subtree)
-				if err != nil {
+				if err != nil && err != context.Canceled {
 					Warnf("error: %v\n", err)
 				}
 			}
 		case !t1 && t2:
 			prefix := path.Join(prefix, name)
-			if node2.Type == "dir" {
+			if node2.Type == restic.NodeTypeDir {
 				prefix += "/"
 			}
 			c.printChange(NewChange(prefix, "+"))
 			stats.Added.Add(node2)
 
-			if node2.Type == "dir" {
+			if node2.Type == restic.NodeTypeDir {
 				err := c.printDir(ctx, "+", &stats.Added, stats.BlobsAfter, prefix, *node2.Subtree)
-				if err != nil {
+				if err != nil && err != context.Canceled {
 					Warnf("error: %v\n", err)
 				}
 			}
 		}
 	}
 
-	return nil
+	return ctx.Err()
 }
 
 func runDiff(ctx context.Context, opts DiffOptions, gopts GlobalOptions, args []string) error {
@@ -331,22 +364,14 @@ func runDiff(ctx context.Context, opts DiffOptions, gopts GlobalOptions, args []
 		return errors.Fatalf("specify two snapshot IDs")
 	}
 
-	repo, err := OpenRepository(ctx, gopts)
+	ctx, repo, unlock, err := openWithReadLock(ctx, gopts, gopts.NoLock)
 	if err != nil {
 		return err
 	}
-
-	if !gopts.NoLock {
-		var lock *restic.Lock
-		lock, ctx, err = lockRepo(ctx, repo, gopts.RetryLock, gopts.JSON)
-		defer unlockRepo(lock)
-		if err != nil {
-			return err
-		}
-	}
+	defer unlock()
 
 	// cache snapshots listing
-	be, err := backend.MemorizeList(ctx, repo.Backend(), restic.SnapshotFile)
+	be, err := restic.MemorizeList(ctx, repo, restic.SnapshotFile)
 	if err != nil {
 		return err
 	}
@@ -388,7 +413,7 @@ func runDiff(ctx context.Context, opts DiffOptions, gopts GlobalOptions, args []
 
 	c := &Comparer{
 		repo: repo,
-		opts: diffOptions,
+		opts: opts,
 		printChange: func(change *Change) {
 			Printf("%-5s%v\n", change.Modifier, change.Path)
 		},
@@ -405,7 +430,7 @@ func runDiff(ctx context.Context, opts DiffOptions, gopts GlobalOptions, args []
 	}
 
 	if gopts.Quiet {
-		c.printChange = func(change *Change) {}
+		c.printChange = func(_ *Change) {}
 	}
 
 	stats := &DiffStatsContainer{
@@ -440,8 +465,8 @@ func runDiff(ctx context.Context, opts DiffOptions, gopts GlobalOptions, args []
 		Printf("Others:      %5d new, %5d removed\n", stats.Added.Others, stats.Removed.Others)
 		Printf("Data Blobs:  %5d new, %5d removed\n", stats.Added.DataBlobs, stats.Removed.DataBlobs)
 		Printf("Tree Blobs:  %5d new, %5d removed\n", stats.Added.TreeBlobs, stats.Removed.TreeBlobs)
-		Printf("  Added:   %-5s\n", ui.FormatBytes(uint64(stats.Added.Bytes)))
-		Printf("  Removed: %-5s\n", ui.FormatBytes(uint64(stats.Removed.Bytes)))
+		Printf("  Added:   %-5s\n", ui.FormatBytes(stats.Added.Bytes))
+		Printf("  Removed: %-5s\n", ui.FormatBytes(stats.Removed.Bytes))
 	}
 
 	return nil

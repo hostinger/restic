@@ -94,7 +94,11 @@ func (e ExpirePolicy) String() (s string) {
 		s += fmt.Sprintf("all snapshots within %s of the newest", e.Within)
 	}
 
-	s = "keep " + s
+	if s == "" {
+		s = "remove"
+	} else {
+		s = "keep " + s
+	}
 
 	return s
 }
@@ -186,16 +190,6 @@ func ApplyPolicy(list Snapshots, p ExpirePolicy) (keep, remove Snapshots, reason
 	// sort newest snapshots first
 	sort.Stable(list)
 
-	if p.Empty() {
-		for _, sn := range list {
-			reasons = append(reasons, KeepReason{
-				Snapshot: sn,
-				Matches:  []string{"policy is empty"},
-			})
-		}
-		return list, remove, reasons
-	}
-
 	if len(list) == 0 {
 		return list, nil, nil
 	}
@@ -262,6 +256,9 @@ func ApplyPolicy(list Snapshots, p ExpirePolicy) (keep, remove Snapshots, reason
 				if val != b.Last || nr == len(list)-1 {
 					debug.Log("keep %v %v, bucker %v, val %v\n", cur.Time, cur.id.Str(), i, val)
 					keepSnap = true
+					if val == b.Last && nr == len(list)-1 {
+						b.reason = fmt.Sprintf("oldest %v", b.reason)
+					}
 					buckets[i].Last = val
 					if buckets[i].Count > 0 {
 						buckets[i].Count--
@@ -281,6 +278,9 @@ func ApplyPolicy(list Snapshots, p ExpirePolicy) (keep, remove Snapshots, reason
 					if val != b.Last || nr == len(list)-1 {
 						debug.Log("keep %v, time %v, ID %v, bucker %v, val %v %v\n", b.reason, cur.Time, cur.id.Str(), i, val, b.Last)
 						keepSnap = true
+						if val == b.Last && nr == len(list)-1 {
+							b.reason = fmt.Sprintf("oldest %v", b.reason)
+						}
 						bucketsWithin[i].Last = val
 						keepSnapReasons = append(keepSnapReasons, fmt.Sprintf("%v %v", b.reason, b.Within))
 					}

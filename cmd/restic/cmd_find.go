@@ -8,8 +8,8 @@ import (
 	"time"
 
 	"github.com/spf13/cobra"
+	"github.com/spf13/pflag"
 
-	"github.com/restic/restic/internal/backend"
 	"github.com/restic/restic/internal/debug"
 	"github.com/restic/restic/internal/errors"
 	"github.com/restic/restic/internal/filter"
@@ -17,14 +17,19 @@ import (
 	"github.com/restic/restic/internal/walker"
 )
 
-var cmdFind = &cobra.Command{
-	Use:   "find [flags] PATTERN...",
-	Short: "Find a file, a directory or restic IDs",
-	Long: `
+func newFindCommand() *cobra.Command {
+	var opts FindOptions
+
+	cmd := &cobra.Command{
+		Use:   "find [flags] PATTERN...",
+		Short: "Find a file, a directory or restic IDs",
+		Long: `
 The "find" command searches for files or directories in snapshots stored in the
 repo.
-It can also be used to search for restic blobs or trees for troubleshooting.`,
-	Example: `restic find config.json
+It can also be used to search for restic blobs or trees for troubleshooting.
+The default sort option for the snapshots is youngest to oldest. To sort the
+output from oldest to youngest specify --reverse.`,
+		Example: `restic find config.json
 restic find --json "*.yml" "*.json"
 restic find --json --blob 420f620f b46ebe8a ddd38656
 restic find --show-pack-id --blob 420f620f
@@ -34,12 +39,21 @@ restic find --pack 025c1d06
 EXIT STATUS
 ===========
 
-Exit status is 0 if the command was successful, and non-zero if there was any error.
+Exit status is 0 if the command was successful.
+Exit status is 1 if there was any error.
+Exit status is 10 if the repository does not exist.
+Exit status is 11 if the repository is already locked.
+Exit status is 12 if the password is incorrect.
 `,
-	DisableAutoGenTag: true,
-	RunE: func(cmd *cobra.Command, args []string) error {
-		return runFind(cmd.Context(), findOptions, globalOptions, args)
-	},
+		GroupID:           cmdGroupDefault,
+		DisableAutoGenTag: true,
+		RunE: func(cmd *cobra.Command, args []string) error {
+			return runFind(cmd.Context(), opts, globalOptions, args)
+		},
+	}
+
+	opts.AddFlags(cmd.Flags())
+	return cmd
 }
 
 // FindOptions bundles all options for the find command.
@@ -52,27 +66,24 @@ type FindOptions struct {
 	CaseInsensitive    bool
 	ListLong           bool
 	HumanReadable      bool
+	Reverse            bool
 	restic.SnapshotFilter
 }
 
-var findOptions FindOptions
+func (opts *FindOptions) AddFlags(f *pflag.FlagSet) {
+	f.StringVarP(&opts.Oldest, "oldest", "O", "", "oldest modification date/time")
+	f.StringVarP(&opts.Newest, "newest", "N", "", "newest modification date/time")
+	f.StringArrayVarP(&opts.Snapshots, "snapshot", "s", nil, "snapshot `id` to search in (can be given multiple times)")
+	f.BoolVar(&opts.BlobID, "blob", false, "pattern is a blob-ID")
+	f.BoolVar(&opts.TreeID, "tree", false, "pattern is a tree-ID")
+	f.BoolVar(&opts.PackID, "pack", false, "pattern is a pack-ID")
+	f.BoolVar(&opts.ShowPackID, "show-pack-id", false, "display the pack-ID the blobs belong to (with --blob or --tree)")
+	f.BoolVarP(&opts.CaseInsensitive, "ignore-case", "i", false, "ignore case for pattern")
+	f.BoolVarP(&opts.Reverse, "reverse", "R", false, "reverse sort order oldest to newest")
+	f.BoolVarP(&opts.ListLong, "long", "l", false, "use a long listing format showing size and mode")
+	f.BoolVar(&opts.HumanReadable, "human-readable", false, "print sizes in human readable format")
 
-func init() {
-	cmdRoot.AddCommand(cmdFind)
-
-	f := cmdFind.Flags()
-	f.StringVarP(&findOptions.Oldest, "oldest", "O", "", "oldest modification date/time")
-	f.StringVarP(&findOptions.Newest, "newest", "N", "", "newest modification date/time")
-	f.StringArrayVarP(&findOptions.Snapshots, "snapshot", "s", nil, "snapshot `id` to search in (can be given multiple times)")
-	f.BoolVar(&findOptions.BlobID, "blob", false, "pattern is a blob-ID")
-	f.BoolVar(&findOptions.TreeID, "tree", false, "pattern is a tree-ID")
-	f.BoolVar(&findOptions.PackID, "pack", false, "pattern is a pack-ID")
-	f.BoolVar(&findOptions.ShowPackID, "show-pack-id", false, "display the pack-ID the blobs belong to (with --blob or --tree)")
-	f.BoolVarP(&findOptions.CaseInsensitive, "ignore-case", "i", false, "ignore case for pattern")
-	f.BoolVarP(&findOptions.ListLong, "long", "l", false, "use a long listing format showing size and mode")
-	f.BoolVar(&findOptions.HumanReadable, "human-readable", false, "print sizes in human readable format")
-
-	initMultiSnapshotFilter(f, &findOptions.SnapshotFilter, true)
+	initMultiSnapshotFilter(f, &opts.SnapshotFilter, true)
 }
 
 type findPattern struct {
@@ -126,8 +137,8 @@ func (s *statefulOutput) PrintPatternJSON(path string, node *restic.Node) {
 
 		// Make the following attributes disappear
 		Name               byte `json:"name,omitempty"`
-		Inode              byte `json:"inode,omitempty"`
 		ExtendedAttributes byte `json:"extended_attributes,omitempty"`
+		GenericAttributes  byte `json:"generic_attributes,omitempty"`
 		Device             byte `json:"device,omitempty"`
 		Content            byte `json:"content,omitempty"`
 		Subtree            byte `json:"subtree,omitempty"`
@@ -246,13 +257,12 @@ func (s *statefulOutput) Finish() {
 
 // Finder bundles information needed to find a file or directory.
 type Finder struct {
-	repo        restic.Repository
-	pat         findPattern
-	out         statefulOutput
-	ignoreTrees restic.IDSet
-	blobIDs     map[string]struct{}
-	treeIDs     map[string]struct{}
-	itemsFound  int
+	repo       restic.Repository
+	pat        findPattern
+	out        statefulOutput
+	blobIDs    map[string]struct{}
+	treeIDs    map[string]struct{}
+	itemsFound int
 }
 
 func (f *Finder) findInSnapshot(ctx context.Context, sn *restic.Snapshot) error {
@@ -263,17 +273,17 @@ func (f *Finder) findInSnapshot(ctx context.Context, sn *restic.Snapshot) error 
 	}
 
 	f.out.newsn = sn
-	return walker.Walk(ctx, f.repo, *sn.Tree, f.ignoreTrees, func(parentTreeID restic.ID, nodepath string, node *restic.Node, err error) (bool, error) {
+	return walker.Walk(ctx, f.repo, *sn.Tree, walker.WalkVisitor{ProcessNode: func(parentTreeID restic.ID, nodepath string, node *restic.Node, err error) error {
 		if err != nil {
 			debug.Log("Error loading tree %v: %v", parentTreeID, err)
 
 			Printf("Unable to load tree %s\n ... which belongs to snapshot %s\n", parentTreeID, sn.ID())
 
-			return false, walker.ErrSkipNode
+			return walker.ErrSkipNode
 		}
 
 		if node == nil {
-			return false, nil
+			return nil
 		}
 
 		normalizedNodepath := nodepath
@@ -286,7 +296,7 @@ func (f *Finder) findInSnapshot(ctx context.Context, sn *restic.Snapshot) error 
 		for _, pat := range f.pat.pattern {
 			found, err := filter.Match(pat, normalizedNodepath)
 			if err != nil {
-				return false, err
+				return err
 			}
 			if found {
 				foundMatch = true
@@ -294,16 +304,13 @@ func (f *Finder) findInSnapshot(ctx context.Context, sn *restic.Snapshot) error 
 			}
 		}
 
-		var (
-			ignoreIfNoMatch = true
-			errIfNoMatch    error
-		)
-		if node.Type == "dir" {
+		var errIfNoMatch error
+		if node.Type == restic.NodeTypeDir {
 			var childMayMatch bool
 			for _, pat := range f.pat.pattern {
 				mayMatch, err := filter.ChildMatch(pat, normalizedNodepath)
 				if err != nil {
-					return false, err
+					return err
 				}
 				if mayMatch {
 					childMayMatch = true
@@ -312,31 +319,48 @@ func (f *Finder) findInSnapshot(ctx context.Context, sn *restic.Snapshot) error 
 			}
 
 			if !childMayMatch {
-				ignoreIfNoMatch = true
 				errIfNoMatch = walker.ErrSkipNode
-			} else {
-				ignoreIfNoMatch = false
 			}
 		}
 
 		if !foundMatch {
-			return ignoreIfNoMatch, errIfNoMatch
+			return errIfNoMatch
 		}
 
 		if !f.pat.oldest.IsZero() && node.ModTime.Before(f.pat.oldest) {
 			debug.Log("    ModTime is older than %s\n", f.pat.oldest)
-			return ignoreIfNoMatch, errIfNoMatch
+			return errIfNoMatch
 		}
 
 		if !f.pat.newest.IsZero() && node.ModTime.After(f.pat.newest) {
 			debug.Log("    ModTime is newer than %s\n", f.pat.newest)
-			return ignoreIfNoMatch, errIfNoMatch
+			return errIfNoMatch
 		}
 
 		debug.Log("    found match\n")
 		f.out.PrintPattern(nodepath, node)
-		return false, nil
-	})
+		return nil
+	}})
+}
+
+func (f *Finder) findTree(treeID restic.ID, nodepath string) error {
+	found := false
+	if _, ok := f.treeIDs[treeID.String()]; ok {
+		found = true
+	} else if _, ok := f.treeIDs[treeID.Str()]; ok {
+		found = true
+	}
+	if found {
+		f.out.PrintObject("tree", treeID.String(), nodepath, "", f.out.newsn)
+		f.itemsFound++
+		// Terminate if we have found all trees (and we are not
+		// looking for blobs)
+		if f.itemsFound >= len(f.treeIDs) && f.blobIDs == nil {
+			// Return an error to terminate the Walk
+			return errors.New("OK")
+		}
+	}
+	return nil
 }
 
 func (f *Finder) findIDs(ctx context.Context, sn *restic.Snapshot) error {
@@ -347,41 +371,36 @@ func (f *Finder) findIDs(ctx context.Context, sn *restic.Snapshot) error {
 	}
 
 	f.out.newsn = sn
-	return walker.Walk(ctx, f.repo, *sn.Tree, f.ignoreTrees, func(parentTreeID restic.ID, nodepath string, node *restic.Node, err error) (bool, error) {
+	return walker.Walk(ctx, f.repo, *sn.Tree, walker.WalkVisitor{ProcessNode: func(parentTreeID restic.ID, nodepath string, node *restic.Node, err error) error {
 		if err != nil {
 			debug.Log("Error loading tree %v: %v", parentTreeID, err)
 
 			Printf("Unable to load tree %s\n ... which belongs to snapshot %s\n", parentTreeID, sn.ID())
 
-			return false, walker.ErrSkipNode
+			return walker.ErrSkipNode
 		}
 
 		if node == nil {
-			return false, nil
+			if nodepath == "/" {
+				if err := f.findTree(parentTreeID, "/"); err != nil {
+					return err
+				}
+			}
+			return nil
 		}
 
 		if node.Type == "dir" && f.treeIDs != nil {
-			treeID := node.Subtree
-			found := false
-			if _, ok := f.treeIDs[treeID.Str()]; ok {
-				found = true
-			} else if _, ok := f.treeIDs[treeID.String()]; ok {
-				found = true
-			}
-			if found {
-				f.out.PrintObject("tree", treeID.String(), nodepath, "", sn)
-				f.itemsFound++
-				// Terminate if we have found all trees (and we are not
-				// looking for blobs)
-				if f.itemsFound >= len(f.treeIDs) && f.blobIDs == nil {
-					// Return an error to terminate the Walk
-					return true, errors.New("OK")
-				}
+			if err := f.findTree(*node.Subtree, nodepath); err != nil {
+				return err
 			}
 		}
 
-		if node.Type == "file" && f.blobIDs != nil {
+		if node.Type == restic.NodeTypeFile && f.blobIDs != nil {
 			for _, id := range node.Content {
+				if ctx.Err() != nil {
+					return ctx.Err()
+				}
+
 				idStr := id.String()
 				if _, ok := f.blobIDs[idStr]; !ok {
 					// Look for short ID form
@@ -396,8 +415,8 @@ func (f *Finder) findIDs(ctx context.Context, sn *restic.Snapshot) error {
 			}
 		}
 
-		return false, nil
-	})
+		return nil
+	}})
 }
 
 var errAllPacksFound = errors.New("all packs found")
@@ -447,7 +466,10 @@ func (f *Finder) packsToBlobs(ctx context.Context, packs []string) error {
 
 	if err != errAllPacksFound {
 		// try to resolve unknown pack ids from the index
-		packIDs = f.indexPacksToBlobs(ctx, packIDs)
+		packIDs, err = f.indexPacksToBlobs(ctx, packIDs)
+		if err != nil {
+			return err
+		}
 	}
 
 	if len(packIDs) > 0 {
@@ -464,13 +486,13 @@ func (f *Finder) packsToBlobs(ctx context.Context, packs []string) error {
 	return nil
 }
 
-func (f *Finder) indexPacksToBlobs(ctx context.Context, packIDs map[string]struct{}) map[string]struct{} {
+func (f *Finder) indexPacksToBlobs(ctx context.Context, packIDs map[string]struct{}) (map[string]struct{}, error) {
 	wctx, cancel := context.WithCancel(ctx)
 	defer cancel()
 
 	// remember which packs were found in the index
 	indexPackIDs := make(map[string]struct{})
-	f.repo.Index().Each(wctx, func(pb restic.PackedBlob) {
+	err := f.repo.ListBlobs(wctx, func(pb restic.PackedBlob) {
 		idStr := pb.PackID.String()
 		// keep entry in packIDs as Each() returns individual index entries
 		matchingID := false
@@ -489,6 +511,9 @@ func (f *Finder) indexPacksToBlobs(ctx context.Context, packIDs map[string]struc
 			indexPackIDs[idStr] = struct{}{}
 		}
 	})
+	if err != nil {
+		return nil, err
+	}
 
 	for id := range indexPackIDs {
 		delete(packIDs, id)
@@ -501,19 +526,17 @@ func (f *Finder) indexPacksToBlobs(ctx context.Context, packIDs map[string]struc
 		}
 		Warnf("some pack files are missing from the repository, getting their blobs from the repository index: %v\n\n", list)
 	}
-	return packIDs
+	return packIDs, nil
 }
 
 func (f *Finder) findObjectPack(id string, t restic.BlobType) {
-	idx := f.repo.Index()
-
 	rid, err := restic.ParseID(id)
 	if err != nil {
 		Printf("Note: cannot find pack for object '%s', unable to parse ID: %v\n", id, err)
 		return
 	}
 
-	blobs := idx.Lookup(restic.BlobHandle{ID: rid, Type: t})
+	blobs := f.repo.LookupBlob(t, rid)
 	if len(blobs) == 0 {
 		Printf("Object %s not found in the index\n", rid.Str())
 		return
@@ -571,21 +594,13 @@ func runFind(ctx context.Context, opts FindOptions, gopts GlobalOptions, args []
 		return errors.Fatal("cannot have several ID types")
 	}
 
-	repo, err := OpenRepository(ctx, gopts)
+	ctx, repo, unlock, err := openWithReadLock(ctx, gopts, gopts.NoLock)
 	if err != nil {
 		return err
 	}
+	defer unlock()
 
-	if !gopts.NoLock {
-		var lock *restic.Lock
-		lock, ctx, err = lockRepo(ctx, repo, gopts.RetryLock, gopts.JSON)
-		defer unlockRepo(lock)
-		if err != nil {
-			return err
-		}
-	}
-
-	snapshotLister, err := backend.MemorizeList(ctx, repo.Backend(), restic.SnapshotFile)
+	snapshotLister, err := restic.MemorizeList(ctx, repo, restic.SnapshotFile)
 	if err != nil {
 		return err
 	}
@@ -595,10 +610,9 @@ func runFind(ctx context.Context, opts FindOptions, gopts GlobalOptions, args []
 	}
 
 	f := &Finder{
-		repo:        repo,
-		pat:         pat,
-		out:         statefulOutput{ListLong: opts.ListLong, HumanReadable: opts.HumanReadable, JSON: gopts.JSON},
-		ignoreTrees: restic.NewIDSet(),
+		repo: repo,
+		pat:  pat,
+		out:  statefulOutput{ListLong: opts.ListLong, HumanReadable: opts.HumanReadable, JSON: gopts.JSON},
 	}
 
 	if opts.BlobID {
@@ -625,9 +639,15 @@ func runFind(ctx context.Context, opts FindOptions, gopts GlobalOptions, args []
 	for sn := range FindFilteredSnapshots(ctx, snapshotLister, repo, &opts.SnapshotFilter, opts.Snapshots) {
 		filteredSnapshots = append(filteredSnapshots, sn)
 	}
+	if ctx.Err() != nil {
+		return ctx.Err()
+	}
 
 	sort.Slice(filteredSnapshots, func(i, j int) bool {
-		return filteredSnapshots[i].Time.Before(filteredSnapshots[j].Time)
+		if opts.Reverse {
+			return filteredSnapshots[i].Time.Before(filteredSnapshots[j].Time)
+		}
+		return filteredSnapshots[i].Time.After(filteredSnapshots[j].Time)
 	})
 
 	for _, sn := range filteredSnapshots {
