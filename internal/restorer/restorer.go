@@ -34,6 +34,8 @@ type Restorer struct {
 	SelectFilter func(item string, isDir bool) (selectedForRestore bool, childMayBeSelected bool)
 
 	XattrSelectFilter func(xattrName string) (xattrSelectedForRestore bool)
+
+	NodeFilter func(item string, node *restic.Node) bool
 }
 
 var restorerAbortOnAllErrors = func(_ string, err error) error { return err }
@@ -107,6 +109,7 @@ func NewRestorer(repo restic.Repository, sn *restic.Snapshot, opts Options) *Res
 		SelectFilter:      func(string, bool) (bool, bool) { return true, true },
 		XattrSelectFilter: func(string) bool { return true },
 		sn:                sn,
+		NodeFilter:        func(item string, node *restic.Node) bool { return true },
 	}
 
 	return r
@@ -207,6 +210,11 @@ func (res *Restorer) traverseTreeInner(ctx context.Context, target, location str
 
 		// sockets cannot be restored
 		if node.Type == restic.NodeTypeSocket {
+			continue
+		}
+
+		if !res.NodeFilter(nodeTarget, node) {
+			debug.Log("NodeFilter filtered %s", nodeTarget)
 			continue
 		}
 
